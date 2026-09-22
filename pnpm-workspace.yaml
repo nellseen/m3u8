@@ -1,0 +1,8 @@
+allowBuilds:
+  '@google/genai': set this to true or false
+  bufferutil: true
+  core-js: true
+  es5-ext: true
+  esbuild: true
+  protobufjs: set this to true or false
+  utf-8-validate: true

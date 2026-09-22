@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Video HLS Fallback Userbot",
+  "description": "Telegram Userbot video downloader with multi-layer HLS/M3U8 fallback orchestrator and FFmpeg processing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
