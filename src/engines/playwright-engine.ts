@@ -10,6 +10,7 @@ import {
 } from '../utils/system.ts';
 import { isHlsContentType, isM3u8Url, normalizeMediaUrl } from '../utils/url-extractor.ts';
 import { scanHtmlForM3u8AndMedia } from '../utils/m3u8-detector.ts';
+import { normalizeCookies, mergeCookieStrings } from '../utils/cookie-manager.ts';
 import { extractHtmlMetadata } from '../utils/metadata.ts';
 import { FfmpegEngine } from './ffmpeg-engine.ts';
 import { YtdlpEngine } from './ytdlp-engine.ts';
@@ -191,6 +192,14 @@ export class PlaywrightEngine extends BaseEngine {
             contentType.includes('video/mp4') ||
             contentType.includes('video/webm');
 
+          // Capture Set-Cookie headers from media / auth responses
+          const setCookieHeader = response.headers()['set-cookie'];
+          if (setCookieHeader) {
+            const normalized = normalizeCookies(setCookieHeader);
+            task.cookies = mergeCookieStrings(task.cookies, normalized);
+            detectedHeaders['cookie'] = task.cookies;
+          }
+
           if (isHlsMime || isHlsFromUrl || isVideoMime) {
             logger.info(`[Playwright] Intercepted media response (${contentType || 'url-match'}): ${respUrl}`);
             const req = response.request();
@@ -299,12 +308,14 @@ export class PlaywrightEngine extends BaseEngine {
         // Ignore content read errors
       }
 
-      // Extract cookies from session
+      // Extract cookies from session (session, auth, Cloudflare cf_clearance/__cf_bm, player cookies)
       try {
         const cookies = await context.cookies();
         if (cookies && cookies.length > 0) {
-          task.cookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+          const normalized = normalizeCookies(cookies);
+          task.cookies = mergeCookieStrings(task.cookies, normalized);
           detectedHeaders['cookie'] = task.cookies;
+          logger.info(`[Playwright] Captured & normalized ${cookies.length} session/auth cookie(s)`);
         }
       } catch {
         // Ignore cookie read errors

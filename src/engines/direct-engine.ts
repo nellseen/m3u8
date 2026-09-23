@@ -6,6 +6,7 @@ import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
 import { analyzeUrl, isHlsContentType, normalizeMediaUrl } from '../utils/url-extractor.ts';
 import { scanHtmlForM3u8AndMedia } from '../utils/m3u8-detector.ts';
+import { normalizeCookies, mergeCookieStrings } from '../utils/cookie-manager.ts';
 import { remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
 import { formatBytes } from '../utils/system.ts';
 import { extractHtmlMetadata } from '../utils/metadata.ts';
@@ -94,8 +95,9 @@ export class DirectEngine extends BaseEngine {
 
       // Capture Set-Cookie if any returned
       const setCookie = res.headers.get('set-cookie');
-      if (setCookie && !task.cookies) {
-        task.cookies = setCookie.split(';')[0];
+      if (setCookie) {
+        const normalized = normalizeCookies(setCookie);
+        task.cookies = mergeCookieStrings(task.cookies, normalized);
       }
 
       // Check HTTP Response Content-Type:

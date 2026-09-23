@@ -8,6 +8,7 @@ import { FfmpegEngine } from './ffmpeg-engine.ts';
 import { RetryEngine } from './retry-engine.ts';
 import { DownloadTask, EngineResult, ErrorCategory } from '../types.ts';
 import { killTaskProcesses } from '../utils/cleaner.ts';
+import { validateMediaFile } from '../utils/ffmpeg.ts';
 import { logger } from '../logger.ts';
 
 function classifyError(errStr: string, explicitType?: ErrorCategory, hasStreamUrl = false): ErrorCategory {
@@ -113,9 +114,20 @@ export class FallbackOrchestrator {
 
         const durationMs = Date.now() - engineStart;
 
-        if (result.success && result.outputPath) {
-          logger.info(`✅ Success with [${engine.name}] in ${(durationMs / 1000).toFixed(1)}s`);
-          return result;
+        if (result.success && result.outputPath && fs.existsSync(result.outputPath)) {
+          // Double check audio + video stream integrity: do not accept video-only output if audio is expected
+          const mediaCheck = await validateMediaFile(result.outputPath);
+          if (mediaCheck.valid) {
+            // Check if audio is missing
+            if (mediaCheck.meta.hasVideo && !mediaCheck.meta.hasAudio && i < this.engines.length - 1) {
+              logger.warn(`[Orchestrator] ${engine.name} produced output without audio track. Trying subsequent engines for complete audio+video...`);
+              onProgressUpdate?.(`⚠️ ${engine.name} output missing audio track. Trying next engine for audio...`);
+              // Let loop continue to next engine to recover audio
+            } else {
+              logger.info(`✅ Success with [${engine.name}] in ${(durationMs / 1000).toFixed(1)}s (hasVideo=${mediaCheck.meta.hasVideo}, hasAudio=${mediaCheck.meta.hasAudio})`);
+              return result;
+            }
+          }
         }
 
         // Failure on this engine -> Record, clean up, and continue to next engine

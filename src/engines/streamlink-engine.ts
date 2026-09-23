@@ -5,6 +5,7 @@ import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
 import { getStreamlinkPath } from '../utils/system.ts';
 import { remuxToTelegramMp4, validateMediaFile } from '../utils/ffmpeg.ts';
+import { normalizeCookies } from '../utils/cookie-manager.ts';
 import { logger } from '../logger.ts';
 
 export class StreamlinkEngine extends BaseEngine {
@@ -69,8 +70,9 @@ export class StreamlinkEngine extends BaseEngine {
       }
     }
 
-    if (task.cookies) {
-      args.push('--http-header', `Cookie=${task.cookies}`);
+    const normCookies = normalizeCookies(task.cookies);
+    if (normCookies) {
+      args.push('--http-header', `Cookie=${normCookies}`);
     }
 
     // Prioritize 720p, then lower resolutions, avoiding 1080p/4k unless fallback

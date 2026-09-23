@@ -5,6 +5,7 @@ import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
 import { getYtdlpPath, getFfmpegPath } from '../utils/system.ts';
 import { validateMediaFile, remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
+import { normalizeCookies } from '../utils/cookie-manager.ts';
 import { ensureIndonesianTitle } from '../utils/translator.ts';
 import { logger } from '../logger.ts';
 
@@ -92,8 +93,9 @@ export class YtdlpEngine extends BaseEngine {
       }
     }
 
-    if (task.cookies) {
-      args.push('--add-header', `Cookie:${task.cookies}`);
+    const normCookies = normalizeCookies(task.cookies);
+    if (normCookies) {
+      args.push('--add-header', `Cookie:${normCookies}`);
     }
 
     args.push(targetUrl);

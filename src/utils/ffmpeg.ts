@@ -114,8 +114,12 @@ export async function probeMedia(filePath: string): Promise<MediaMetadata> {
 
 /**
  * Validates that the downloaded file is a genuine, playable video with valid streams.
+ * If requireAudio is true, checks that audio track is present.
  */
-export async function validateMediaFile(filePath: string): Promise<MediaValidationResult> {
+export async function validateMediaFile(
+  filePath: string,
+  options?: { requireAudio?: boolean }
+): Promise<MediaValidationResult> {
   if (!fs.existsSync(filePath)) {
     return {
       valid: false,
@@ -140,6 +144,14 @@ export async function validateMediaFile(filePath: string): Promise<MediaValidati
       valid: false,
       meta,
       error: 'No valid video stream detected in container',
+    };
+  }
+
+  if (options?.requireAudio && !meta.hasAudio) {
+    return {
+      valid: false,
+      meta,
+      error: 'Audio stream missing from media file (hasAudio=false)',
     };
   }
 

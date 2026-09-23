@@ -3,6 +3,8 @@ import path from 'path';
 import { execSync } from 'child_process';
 import { extractUrlsFromText, analyzeUrl, isHlsContentType, isM3u8Url, normalizeMediaUrl } from '../src/utils/url-extractor.ts';
 import { scanHtmlForM3u8AndMedia } from '../src/utils/m3u8-detector.ts';
+import { parseMasterPlaylist, selectTargetVariant } from '../src/utils/m3u8-parser.ts';
+import { normalizeCookies, mergeCookieStrings } from '../src/utils/cookie-manager.ts';
 import { FallbackOrchestrator } from '../src/engines/orchestrator.ts';
 import { buildFfmpegHeaders } from '../src/engines/ffmpeg-engine.ts';
 import {
@@ -114,6 +116,70 @@ async function runSelfAudit() {
   assert(builtFfmpegHeaders.includes('Authorization: Bearer test-token-xyz'), 'Propagate Authorization header');
   assert(builtFfmpegHeaders.includes('Cookie: session_id=abc1234'), 'Propagate Cookie header');
   assert(builtFfmpegHeaders.includes('Sec-Fetch-Mode: cors'), 'Propagate genuine Sec-Fetch header');
+
+  // Test Cookie Normalization & Propagation Pipeline
+  const mockPlaywrightCookies = [
+    { name: 'cf_clearance', value: 'secret_cf_token_123', domain: '.stream.com' },
+    { name: '__cf_bm', value: 'bm_token_456', domain: '.stream.com' },
+    { name: 'session_auth', value: 'user_auth_789', domain: 'stream.com' },
+    { name: 'player_volume', value: '0.8' },
+  ];
+  const normalizedFromPw = normalizeCookies(mockPlaywrightCookies);
+  assert(normalizedFromPw.includes('cf_clearance=secret_cf_token_123'), 'Normalize Cloudflare clearance cookie');
+  assert(normalizedFromPw.includes('__cf_bm=bm_token_456'), 'Normalize Cloudflare bot management cookie');
+  assert(normalizedFromPw.includes('session_auth=user_auth_789'), 'Normalize session auth cookie');
+  
+  const mergedCookies = mergeCookieStrings(normalizedFromPw, 'new_auth=updated_val; session_auth=latest_auth');
+  assert(mergedCookies.includes('session_auth=latest_auth'), 'Cookie merge preserves latest updated auth cookie');
+  assert(mergedCookies.includes('new_auth=updated_val'), 'Cookie merge appends incoming cookies');
+
+  // Test M3U8 Master Playlist Parser & Variant Selection (Max 720p enforcement)
+  const sampleMasterPlaylist = `
+#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-aac",NAME="English",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="en",URI="/hls/audio/en.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-aac",NAME="Spanish",DEFAULT=NO,AUTOSELECT=NO,LANGUAGE="es",URI="/hls/audio/es.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2",FRAME-RATE=29.970,AUDIO="audio-aac"
+/hls/video_360p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=854x480,CODECS="avc1.4d401f,mp4a.40.2",FRAME-RATE=29.970,AUDIO="audio-aac"
+/hls/video_480p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2",FRAME-RATE=59.940,AUDIO="audio-aac"
+/hls/video_720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2",FRAME-RATE=59.940,AUDIO="audio-aac"
+/hls/video_1080p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=12000000,RESOLUTION=3840x2160,CODECS="hvc1.1.6.L150.B0",FRAME-RATE=60.000,AUDIO="audio-aac"
+/hls/video_2160p.m3u8
+`;
+  const parsedMaster = parseMasterPlaylist(sampleMasterPlaylist, 'https://origin.cdn.com/master.m3u8');
+  assert(parsedMaster.isMaster === true, 'Parse master playlist detects isMaster=true');
+  assert(parsedMaster.variants.length === 5, 'Parsed all 5 stream variants');
+  assert(parsedMaster.audioGroups.length === 2, 'Parsed 2 audio group tracks');
+  assert(
+    parsedMaster.selectedVariant?.resolution === '1280x720',
+    'Prioritize <= 720p variant over 1080p/2160p when 720p available'
+  );
+  assert(
+    parsedMaster.selectedVariant?.uri === 'https://origin.cdn.com/hls/video_720p.m3u8',
+    'Selected 720p variant has correct normalized URI'
+  );
+  assert(
+    parsedMaster.selectedVariant?.audioTrackUri === 'https://origin.cdn.com/hls/audio/en.m3u8',
+    'Associated default separated audio track with video variant'
+  );
+
+  // Test Selection when only higher resolutions exist (e.g. 1080p and 4K) -> Pick closest
+  const highResOnlyPlaylist = `
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=14000000,RESOLUTION=3840x2160
+/hls/4k.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080
+/hls/1080p.m3u8
+`;
+  const parsedHighOnly = parseMasterPlaylist(highResOnlyPlaylist, 'https://origin.cdn.com/hls/master.m3u8');
+  assert(
+    parsedHighOnly.selectedVariant?.resolution === '1920x1080',
+    'When no variant <= 720p exists, select closest resolution (1080p over 4K)'
+  );
 
   const mp4Analysis = analyzeUrl('https://example.com/files/sample.mp4');
   assert(mp4Analysis.isDirectVideo === true, 'Classify direct MP4 URL');
@@ -233,6 +299,22 @@ async function runSelfAudit() {
   const validation = await validateMediaFile(sampleVideo360p);
   assert(validation.valid === true, 'validateMediaFile confirms valid container and streams');
 
+  // Test hasVideo and hasAudio validation
+  assert(validation.meta.hasVideo === true, 'Probe confirms hasVideo=true on synthetic sample');
+  assert(validation.meta.hasAudio === true, 'Probe confirms hasAudio=true on synthetic sample with sine audio');
+
+  // Generate a video-only synthetic sample to verify missing audio detection
+  const sampleVideoNoAudio = path.join(config.tempDir, `sample_no_audio_${Date.now()}.mp4`);
+  execSync(
+    `ffmpeg -y -f lavfi -i testsrc=duration=1:size=320x240:rate=15 -an -c:v libx264 "${sampleVideoNoAudio}"`,
+    { stdio: 'ignore' }
+  );
+  const probeNoAudio = await probeMedia(sampleVideoNoAudio);
+  assert(probeNoAudio.hasVideo === true && !probeNoAudio.hasAudio, 'Probe detects video without audio');
+  const requireAudioVal = await validateMediaFile(sampleVideoNoAudio, { requireAudio: true });
+  assert(requireAudioVal.valid === false, 'validateMediaFile rejects media missing audio when requireAudio is true');
+  try { fs.unlinkSync(sampleVideoNoAudio); } catch {}
+
   // TEST 7: Max 720p Resolution Policy (Downscaling >720p, NO Upscaling <=720p)
   console.log('\n--- 7. Testing 720p Resolution Enforcement (Max 720p, No Upscaling) ---');
 
@@ -325,9 +407,9 @@ async function runSelfAudit() {
   fs.mkdirSync(hlsLocalDir, { recursive: true });
   const hlsManifest = path.join(hlsLocalDir, 'test_stream.m3u8');
 
-  // Generate 2-second segmented HLS stream
+  // Generate 2-second segmented HLS stream with both video and audio
   execSync(
-    `ffmpeg -y -f lavfi -i testsrc=duration=2:size=320x240:rate=25 -c:v libx264 -f hls -hls_time 1 -hls_list_size 0 "${hlsManifest}"`,
+    `ffmpeg -y -f lavfi -i testsrc=duration=2:size=320x240:rate=25 -f lavfi -i sine=frequency=1000:duration=2 -c:v libx264 -c:a aac -f hls -hls_time 1 -hls_list_size 0 "${hlsManifest}"`,
     { stdio: 'ignore' }
   );
   assert(fs.existsSync(hlsManifest), 'Generated test HLS playlist (.m3u8) with segments');
