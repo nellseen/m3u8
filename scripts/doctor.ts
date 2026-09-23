@@ -1,6 +1,5 @@
 import fs from 'fs';
 import path from 'path';
-import { chromium } from 'playwright';
 import { config, isConfigured } from '../src/config.ts';
 import {
   isCommandAvailable,
@@ -9,12 +8,15 @@ import {
   getFfprobePath,
   getYtdlpPath,
   getStreamlinkPath,
-  getChromiumPath,
   isTermuxOrPRoot,
   getAvailableDiskSpace,
   formatBytes,
+  getChromiumCandidates,
+  checkPlaywrightHealth,
+  resolveChromiumExecutable,
+  detectShellConfig,
 } from '../src/utils/system.ts';
-import { DoctorCheckItem } from '../src/types.ts';
+import { DoctorCheckItem, PlaywrightHealthResult, ResolvedChromium } from '../src/types.ts';
 
 const checks: DoctorCheckItem[] = [];
 
@@ -48,26 +50,42 @@ async function runDoctor() {
   console.log('   🔍 Telegram Userbot - System & Doctor Diagnostics');
   console.log('======================================================\n');
 
-  // Summary state indicators
-  const readyStatus: Record<string, { ready: boolean; note?: string }> = {
-    'Direct HLS': { ready: true },
-    'Playwright': { ready: false },
-    'Chromium': { ready: false },
-    'Streamlink': { ready: false },
-    'yt-dlp': { ready: false },
-    'FFmpeg': { ready: false },
-    'Telegram': { ready: false },
+  const { isTermux, isPRoot, arch } = isTermuxOrPRoot();
+  const { shell, configFile } = detectShellConfig();
+
+  // Engine readiness state
+  const readyStatus: Record<string, { status: 'READY' | 'NOT READY' | 'WARNING'; note?: string }> = {
+    'Direct HLS': { status: 'READY' },
+    'Playwright': { status: 'NOT READY' },
+    'Chromium': { status: 'NOT READY' },
+    'Streamlink': { status: 'NOT READY' },
+    'yt-dlp': { status: 'NOT READY' },
+    'FFmpeg': { status: 'NOT READY' },
+    'Telegram': { status: 'WARNING', note: 'SESSION MISSING' },
   };
 
-  // 1. Environment Check
-  check('Environment', 'Runtime Environment', () => {
-    const info = isTermuxOrPRoot();
-    const osType = process.platform;
-    const arch = process.arch;
-    let desc = `${osType} (${arch})`;
-    if (info.isTermux) desc += ' [Termux]';
-    if (info.isPRoot) desc += ' [PRoot Container]';
+  // 1. Environment & Architecture
+  check('Environment', 'Runtime Architecture', () => {
+    let desc = `${process.platform} (${arch})`;
+    if (isTermux) desc += ' [Termux]';
+    if (isPRoot) desc += ' [Ubuntu/PRoot]';
     return { pass: true, details: desc };
+  });
+
+  check('Environment', 'Active Shell & Config', () => {
+    return {
+      pass: true,
+      details: `${shell} (${path.basename(configFile)})`,
+    };
+  });
+
+  check('Environment', 'System Executable PATH', () => {
+    const currentPath = process.env.PATH || '';
+    const dirCount = currentPath.split(':').filter(Boolean).length;
+    return {
+      pass: true,
+      details: `${dirCount} directories in PATH`,
+    };
   });
 
   // 2. Node.js
@@ -79,7 +97,7 @@ async function runDoctor() {
     }
     return {
       pass: false,
-      details: `${ver} is too old`,
+      details: `${ver} is unsupported (< 18)`,
       remedy: 'Update Node.js to version 18 or higher.',
     };
   });
@@ -93,7 +111,7 @@ async function runDoctor() {
     return {
       pass: false,
       details: 'pnpm not found in PATH',
-      remedy: 'Install pnpm: run "npm install -g pnpm"',
+      remedy: 'Install pnpm: run "npm install -g pnpm" or "corepack enable pnpm"',
     };
   });
 
@@ -102,9 +120,9 @@ async function runDoctor() {
     const bin = getFfmpegPath();
     const out = getCommandOutput(`"${bin}" -version`);
     if (out) {
-      readyStatus['FFmpeg'].ready = true;
+      readyStatus['FFmpeg'].status = 'READY';
       const firstLine = out.split('\n')[0];
-      return { pass: true, details: `${bin} (${firstLine.slice(0, 30)}...)` };
+      return { pass: true, details: `${bin} (${firstLine.slice(0, 28)}...)` };
     }
     return {
       pass: false,
@@ -123,7 +141,7 @@ async function runDoctor() {
     return {
       pass: true,
       warn: true,
-      details: 'ffprobe not found, will fallback to ffmpeg inspection',
+      details: 'ffprobe not found (fallback probe active)',
       remedy: 'Install ffmpeg/ffprobe via package manager',
     };
   });
@@ -133,13 +151,13 @@ async function runDoctor() {
     const bin = getYtdlpPath();
     const out = getCommandOutput(`"${bin}" --version`);
     if (out) {
-      readyStatus['yt-dlp'].ready = true;
-      return { pass: true, details: `${bin} (version ${out})` };
+      readyStatus['yt-dlp'].status = 'READY';
+      return { pass: true, details: `${bin} (v${out})` };
     }
     return {
       pass: true,
       warn: true,
-      details: 'yt-dlp binary not found (optional engine)',
+      details: 'yt-dlp binary not found in PATH',
       remedy: 'Install yt-dlp: run "pip3 install --break-system-packages yt-dlp" or "bash scripts/setup.sh"',
     };
   });
@@ -149,71 +167,18 @@ async function runDoctor() {
     const bin = getStreamlinkPath();
     const out = getCommandOutput(`"${bin}" --version`);
     if (out) {
-      readyStatus['Streamlink'].ready = true;
+      readyStatus['Streamlink'].status = 'READY';
       return { pass: true, details: `${bin} (${out.split('\n')[0]})` };
     }
     return {
       pass: true,
       warn: true,
-      details: 'streamlink not found in PATH (optional engine)',
+      details: 'streamlink not found in PATH',
       remedy: 'Install Streamlink: run "pip3 install --break-system-packages streamlink" or "bash scripts/setup.sh"',
     };
   });
 
-  // 7. Chromium & Playwright
-  console.log('Testing Playwright / Chromium launch...');
-  let playwrightPass = false;
-  let chromiumPass = false;
-  let playwrightDetail = '';
-  let playwrightRemedy = '';
-
-  try {
-    const execPath = getChromiumPath();
-    const browser = await chromium.launch({
-      executablePath: execPath,
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-      timeout: 10000,
-    });
-    playwrightDetail = `Browser launch OK (v${browser.version()})`;
-    await browser.close();
-    playwrightPass = true;
-    chromiumPass = true;
-    readyStatus['Playwright'].ready = true;
-    readyStatus['Chromium'].ready = true;
-  } catch (err: any) {
-    playwrightDetail = `Playwright launch note: ${err.message?.slice(0, 60)}`;
-    playwrightRemedy = 'Run "npx playwright install --with-deps chromium" or "apt-get install -y chromium-browser"';
-  }
-
-  checks.push({
-    category: 'Binaries',
-    name: 'Playwright / Chromium Sniffer',
-    status: playwrightPass ? 'PASS' : 'WARN',
-    details: playwrightDetail,
-    remedy: playwrightRemedy,
-  });
-
-  // 8. Package Installation (GramJS / telegram check)
-  try {
-    const tg = await import('telegram');
-    checks.push({
-      category: 'Dependencies',
-      name: 'GramJS (telegram) Package',
-      status: tg && tg.TelegramClient ? 'PASS' : 'FAIL',
-      details: tg && tg.TelegramClient ? 'Loaded successfully from node_modules' : 'Invalid package export',
-    });
-  } catch {
-    checks.push({
-      category: 'Dependencies',
-      name: 'GramJS (telegram) Package',
-      status: 'FAIL',
-      details: 'Missing from node_modules',
-      remedy: 'Run "pnpm install" to install dependencies',
-    });
-  }
-
-  // 9. Storage & Free Disk Protection
+  // 7. Storage Check
   check('Filesystem', 'Storage & Disk Space', () => {
     const freeBytes = getAvailableDiskSpace(config.tempDir);
     const freeFormatted = formatBytes(freeBytes);
@@ -221,17 +186,17 @@ async function runDoctor() {
       return { pass: true, details: `${freeFormatted} free disk space` };
     }
     if (freeBytes > 250 * 1024 * 1024) {
-      return { pass: true, warn: true, details: `${freeFormatted} free (storage low)` };
+      return { pass: true, warn: true, details: `${freeFormatted} free (low storage)` };
     }
     return {
       pass: false,
-      details: `Critically low storage: ${freeFormatted} free`,
-      remedy: 'Free up disk space on your machine.',
+      details: `Critically low disk: ${freeFormatted} free`,
+      remedy: 'Free up storage space before running downloads.',
     };
   });
 
-  // 10. Filesystem & Directory Permissions
-  check('Filesystem', 'Runtime Directories & Permissions', () => {
+  // 8. Filesystem Permissions
+  check('Filesystem', 'Directory Permissions', () => {
     const dirs = [config.tempDir, config.outputDir, config.logDir];
     for (const d of dirs) {
       if (!fs.existsSync(d)) {
@@ -241,51 +206,147 @@ async function runDoctor() {
       fs.writeFileSync(testFile, 'ok');
       fs.unlinkSync(testFile);
     }
+    return { pass: true, details: 'Write/read verified: temp, output, logs' };
+  });
+
+  // 9. Playwright Package Test (Separated from Chromium runtime)
+  console.log('Testing Playwright package & Chromium runtime...');
+  let playwrightPkgPass = false;
+  let playwrightPkgDetail = '';
+  try {
+    const pw = await import('playwright');
+    if (pw && pw.chromium) {
+      playwrightPkgPass = true;
+      playwrightPkgDetail = 'Loaded successfully from node_modules';
+    } else {
+      playwrightPkgDetail = 'Playwright chromium export missing';
+    }
+  } catch (err: any) {
+    playwrightPkgDetail = `Import failed: ${err.message?.slice(0, 60)}`;
+  }
+
+  checks.push({
+    category: 'Playwright',
+    name: 'Playwright Package',
+    status: playwrightPkgPass ? 'PASS' : 'FAIL',
+    details: playwrightPkgDetail,
+    remedy: playwrightPkgPass ? undefined : 'Run "pnpm install" to install playwright',
+  });
+
+  // 10. Chromium Candidate Discovery & Real Multi-Stage Launch Test
+  const candidates = getChromiumCandidates();
+  const existingCandidates = candidates.filter(c => !c.path || c.exists);
+  const candidateSummary = existingCandidates
+    .map(c => `${c.source}:${c.path ? path.basename(c.path) : 'bundled'}`)
+    .join(', ');
+
+  checks.push({
+    category: 'Chromium',
+    name: 'Chromium Candidates Found',
+    status: existingCandidates.length > 0 ? 'PASS' : 'WARN',
+    details: `${existingCandidates.length} candidate(s): ${candidateSummary || 'none'}`,
+    remedy:
+      existingCandidates.length === 0
+        ? 'Run "pnpm exec playwright install chromium" or "apt-get install -y chromium-browser"'
+        : undefined,
+  });
+
+  // Resolve working executable with REAL LAUNCH TEST
+  const resolved = await resolveChromiumExecutable(true);
+
+  // Individual detailed stages for doctor reporting
+  let healthResult: PlaywrightHealthResult = {
+    success: false,
+    stage: 'resolve',
+    error: resolved.error,
+  };
+
+  if (resolved.verified) {
+    healthResult = await checkPlaywrightHealth(resolved.path);
+  } else if (existingCandidates.length > 0) {
+    // Test the first candidate to record where it fails
+    healthResult = await checkPlaywrightHealth(existingCandidates[0].path);
+  }
+
+  // Chromium Launch stage check
+  const launchPassed = Boolean(healthResult.version);
+  checks.push({
+    category: 'Chromium',
+    name: 'Chromium Launch',
+    status: launchPassed ? 'PASS' : 'FAIL',
+    details: launchPassed
+      ? `Launched OK (v${healthResult.version})${healthResult.isSingleProcess ? ' [single-process]' : ''}`
+      : `Failed at launch stage: ${healthResult.error?.slice(0, 50)}`,
+    remedy: !launchPassed
+      ? isPRoot || arch === 'arm64'
+        ? 'In ARM64/PRoot, install system Chromium: "apt-get update && apt-get install -y chromium-browser" or "pkg install chromium", then add CHROMIUM_PATH to .env'
+        : 'Run "pnpm exec playwright install chromium" or check missing libraries'
+      : undefined,
+  });
+
+  // Browser Context stage check
+  const contextPassed = launchPassed && healthResult.stage !== 'context';
+  checks.push({
+    category: 'Chromium',
+    name: 'Browser Context Creation',
+    status: contextPassed ? 'PASS' : launchPassed ? 'FAIL' : 'WARN',
+    details: contextPassed
+      ? 'Context created (1280x720)'
+      : launchPassed
+      ? `Context error: ${healthResult.error?.slice(0, 45)}`
+      : 'NOT TESTED (Launch failed)',
+  });
+
+  // Browser Page & JS Evaluation check
+  const pagePassed = contextPassed && healthResult.stage !== 'page' && healthResult.stage !== 'evaluate';
+  checks.push({
+    category: 'Chromium',
+    name: 'Browser Page & JS Evaluation',
+    status: pagePassed ? 'PASS' : contextPassed ? 'FAIL' : 'WARN',
+    details: pagePassed
+      ? 'Page navigated to about:blank & JS executed'
+      : contextPassed
+      ? `Page/JS error: ${healthResult.error?.slice(0, 45)}`
+      : 'NOT TESTED',
+  });
+
+  // Update overall readiness based on real health verification
+  if (playwrightPkgPass && resolved.verified && pagePassed) {
+    readyStatus['Playwright'].status = 'READY';
+    readyStatus['Chromium'].status = 'READY';
+  } else {
+    readyStatus['Playwright'].status = 'NOT READY';
+    readyStatus['Chromium'].status = 'NOT READY';
+  }
+
+  // 11. Telegram Credentials & Session
+  check('Telegram', 'API Credentials', () => {
+    const configured = isConfigured();
+    if (configured) {
+      return { pass: true, details: 'API ID and API HASH are configured' };
+    }
+    return {
+      pass: false,
+      warn: true,
+      details: 'TELEGRAM_API_ID / TELEGRAM_API_HASH not set in .env',
+      remedy: 'Run "pnpm run login" to input your Telegram credentials interactively.',
+    };
+  });
+
+  check('Telegram', 'Telegram Session', () => {
+    const hasSession = Boolean(config.session);
+    if (hasSession) {
+      readyStatus['Telegram'].status = 'READY';
+      readyStatus['Telegram'].note = undefined;
+      return { pass: true, details: 'Telegram session active' };
+    }
+    readyStatus['Telegram'].status = 'WARNING';
+    readyStatus['Telegram'].note = 'SESSION MISSING';
     return {
       pass: true,
-      details: `Write/read verified: temp, output, logs`,
-    };
-  });
-
-  // 11. Telegram Configuration
-  check('Telegram', 'API Credentials & Session', () => {
-    const hasConfig = isConfigured();
-    const hasSession = Boolean(config.session);
-
-    if (hasConfig && hasSession) {
-      readyStatus['Telegram'].ready = true;
-      return { pass: true, details: 'API ID, API HASH, and Session String are loaded' };
-    }
-    if (hasConfig && !hasSession) {
-      readyStatus['Telegram'].note = 'SESSION MISSING';
-      return {
-        pass: true,
-        warn: true,
-        details: 'API ID & HASH are configured, but TELEGRAM_SESSION is missing.',
-        remedy: 'Run "pnpm run login" in your terminal to authenticate your Telegram account.',
-      };
-    }
-    readyStatus['Telegram'].note = 'NOT CONFIGURED';
-    return {
-      pass: false,
       warn: true,
-      details: 'TELEGRAM_API_ID and TELEGRAM_API_HASH are not set in .env',
-      remedy: 'Run "pnpm run login" in terminal to configure and login to Telegram.',
-    };
-  });
-
-  // 12. Executable PATH check
-  check('Environment', 'System Executable PATH', () => {
-    const currentPath = process.env.PATH || '';
-    const hasLocalBin = currentPath.includes('/usr/local/bin') || currentPath.includes('/usr/bin');
-    if (hasLocalBin) {
-      return { pass: true, details: `PATH verified (${currentPath.split(':').length} dirs)` };
-    }
-    return {
-      pass: false,
-      warn: true,
-      details: 'Standard binary paths may be missing from PATH',
-      remedy: 'Ensure /usr/local/bin and /usr/bin are in your PATH environment variable.',
+      details: 'Session string missing (run "pnpm run login")',
+      remedy: 'Run "pnpm run login" in terminal to authenticate your Telegram account.',
     };
   });
 
@@ -309,20 +370,44 @@ async function runDoctor() {
   }
   console.log('--------------------------------------------------------------------------------------------------\n');
 
-  // Print Engine Readiness Summary (Requirement 22)
+  // Print Engine Readiness Summary (Requirement 22 & L)
   console.log('======================================================');
   console.log('            🚀 Engine & Service Readiness             ');
   console.log('======================================================');
   for (const [engine, info] of Object.entries(readyStatus)) {
     const label = engine.padEnd(16);
-    if (info.ready) {
+    if (info.status === 'READY') {
       console.log(`${label} \x1b[32mREADY\x1b[0m`);
+    } else if (info.status === 'WARNING') {
+      const note = info.note ? ` (${info.note})` : '';
+      console.log(`${label} \x1b[33mWARNING\x1b[0m${note}`);
     } else {
-      const note = info.note ? ` (${info.note})` : ' (NOT INSTALLED / UNAVAILABLE)';
-      console.log(`${label} \x1b[33mNOT READY\x1b[0m${note}`);
+      const note = info.note ? ` (${info.note})` : ' (NOT READY)';
+      console.log(`${label} \x1b[31mNOT READY\x1b[0m${note}`);
     }
   }
   console.log('======================================================\n');
+
+  // Diagnosis for Chromium if failed
+  if (!resolved.verified) {
+    console.log('\x1b[31m⚠️ Chromium Diagnostic Analysis:\x1b[0m');
+    console.log(`  • Platform Architecture: ${arch} | OS: ${process.platform} | PRoot: ${isPRoot}`);
+    console.log(`  • Error Stage:           ${healthResult.stage.toUpperCase()}`);
+    console.log(`  • Failure Cause:         ${healthResult.error || 'Chromium exited unexpectedly'}`);
+
+    if (isPRoot || arch === 'arm64') {
+      console.log('\n\x1b[36m💡 Recommended Solution for PRoot / ARM64:\x1b[0m');
+      console.log('  1. Install system Chromium via apt in your Ubuntu container:');
+      console.log('     apt-get update && apt-get install -y chromium-browser');
+      console.log('  2. Once installed, verify with:');
+      console.log('     which chromium-browser');
+      console.log('  3. Add the path to your .env file:');
+      console.log('     echo "CHROMIUM_PATH=/usr/bin/chromium-browser" >> .env');
+      console.log('  4. Re-run: pnpm doctor\n');
+    }
+  } else {
+    console.log(`\x1b[32m✓ Verified Working Chromium: ${resolved.path || 'Playwright Bundled'} (${resolved.source})\x1b[0m\n`);
+  }
 
   // Print Remedies if any failed or warned
   const issues = checks.filter(c => c.status !== 'PASS');

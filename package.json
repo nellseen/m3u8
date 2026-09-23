@@ -30,8 +30,14 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "esbuild"
+      "@playwright/browser-chromium",
+      "bufferutil",
+      "core-js",
+      "es5-ext",
+      "esbuild",
+      "utf-8-validate"
     ]
   }
 }
+
 

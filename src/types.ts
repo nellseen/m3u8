@@ -117,14 +117,43 @@ export interface DownloadTask {
 }
 
 export interface DoctorCheckItem {
-  category: 'Environment' | 'Dependencies' | 'Binaries' | 'Telegram' | 'Filesystem';
+  category: 'Environment' | 'Dependencies' | 'Binaries' | 'Playwright' | 'Chromium' | 'Telegram' | 'Filesystem';
   name: string;
   status: 'PASS' | 'FAIL' | 'WARN';
   details: string;
   remedy?: string;
 }
 
+export interface ChromiumCandidate {
+  path?: string; // undefined means Playwright bundled
+  source: 'configured' | 'system-path' | 'system-known-location' | 'playwright-bundled' | 'scanned-cache';
+  architecture: string;
+  exists: boolean;
+}
+
+export interface PlaywrightHealthResult {
+  success: boolean;
+  stage: 'resolve' | 'launch' | 'context' | 'page' | 'evaluate' | 'close';
+  version?: string;
+  userAgent?: string;
+  error?: string;
+  stderr?: string;
+  executablePath?: string;
+  isSingleProcess?: boolean;
+}
+
+export interface ResolvedChromium {
+  path: string | undefined;
+  source: 'configured' | 'system-path' | 'system-known-location' | 'playwright-bundled' | 'scanned-cache' | 'none';
+  architecture: string;
+  verified: boolean;
+  version?: string;
+  isSingleProcess?: boolean;
+  error?: string;
+}
+
 export interface BotConfig {
+
   apiId: number;
   apiHash: string;
   session: string;
