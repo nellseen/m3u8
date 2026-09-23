@@ -7,6 +7,9 @@ import {
   isTermuxOrPRoot,
 } from '../utils/system.ts';
 import { extractHtmlMetadata } from '../utils/metadata.ts';
+import { FfmpegEngine } from './ffmpeg-engine.ts';
+import { YtdlpEngine } from './ytdlp-engine.ts';
+import { StreamlinkEngine } from './streamlink-engine.ts';
 import { logger } from '../logger.ts';
 
 export class PlaywrightEngine extends BaseEngine {
@@ -95,7 +98,8 @@ export class PlaywrightEngine extends BaseEngine {
           lower.includes('.m3u8') ||
           lower.includes('master.m3u8') ||
           lower.includes('playlist.m3u8') ||
-          lower.includes('index.m3u8');
+          lower.includes('index.m3u8') ||
+          lower.includes('manifest.m3u8');
         const isDash = lower.includes('.mpd');
         const isVideoFile = lower.includes('.mp4?') || lower.endsWith('.mp4');
 
@@ -113,33 +117,39 @@ export class PlaywrightEngine extends BaseEngine {
             isDash,
           });
 
-          if (!detectedStreamUrl) {
+          // Prioritize HLS manifest over generic video chunks
+          if (!detectedStreamUrl || (isHls && !detectedStreamUrl.toLowerCase().includes('.m3u8'))) {
             detectedStreamUrl = reqUrl;
           }
         }
       });
 
-      // Intercept network responses (by content-type)
+      // Intercept network responses (by content-type and URL)
       page.on('response', response => {
         try {
           const respUrl = response.url();
+          const respLower = respUrl.toLowerCase();
           const contentType = (response.headers()['content-type'] || '').toLowerCase();
           const isHlsMime =
             contentType.includes('application/x-mpegurl') ||
             contentType.includes('application/vnd.apple.mpegurl') ||
             contentType.includes('vnd.apple.mpegurl');
+          const isHlsUrl =
+            respLower.includes('.m3u8') ||
+            respLower.includes('master.m3u8') ||
+            respLower.includes('playlist.m3u8');
           const isVideoMime = contentType.includes('video/');
 
-          if (isHlsMime || isVideoMime) {
-            logger.info(`[Playwright] Intercepted media response (${contentType}): ${respUrl}`);
+          if (isHlsMime || isHlsUrl || isVideoMime) {
+            logger.info(`[Playwright] Intercepted media response (${contentType || 'url-match'}): ${respUrl}`);
             discoveredMedia.push({
               streamUrl: respUrl,
               headers: { ...detectedHeaders },
-              isHls: isHlsMime,
+              isHls: isHlsMime || isHlsUrl,
               mimeType: contentType,
             });
 
-            if (!detectedStreamUrl) {
+            if (!detectedStreamUrl || ((isHlsMime || isHlsUrl) && !detectedStreamUrl.toLowerCase().includes('.m3u8'))) {
               detectedStreamUrl = respUrl;
             }
           }
@@ -176,12 +186,13 @@ export class PlaywrightEngine extends BaseEngine {
 
         for (const u of domMediaUrls) {
           if (u && !discoveredMedia.some(m => m.streamUrl === u)) {
+            const isHls = u.includes('.m3u8');
             discoveredMedia.push({
               streamUrl: u,
               headers: { ...detectedHeaders },
-              isHls: u.includes('.m3u8'),
+              isHls,
             });
-            if (!detectedStreamUrl) {
+            if (!detectedStreamUrl || (isHls && !detectedStreamUrl.toLowerCase().includes('.m3u8'))) {
               detectedStreamUrl = u;
             }
           }
@@ -217,16 +228,101 @@ export class PlaywrightEngine extends BaseEngine {
         await new Promise(r => setTimeout(r, 400));
       }
 
+      // Close browser resources immediately to free memory for downstream downloaders
+      try {
+        if (page) await page.close();
+      } catch {}
+      try {
+        if (context) await context.close();
+      } catch {}
+      try {
+        if (browser) await browser.close();
+      } catch {}
+      page = null;
+      context = null;
+      browser = null;
+
+      // GENERIC FALLBACK: If M3U8 or video stream was intercepted, capture directly and download downstream
       if (detectedStreamUrl) {
+        logger.info(`[Playwright] Successfully intercepted stream: ${detectedStreamUrl}`);
         task.streamUrl = detectedStreamUrl;
         task.streamHeaders = detectedHeaders;
         task.discoveredMedia = discoveredMedia;
 
+        onProgress?.('🔎 Stream intercepted! Handing off to downstream downloader...', 38);
+
+        // Downstream Step 1: FFmpeg Direct HLS remuxing
+        const ffmpegEngine = new FfmpegEngine();
+        if (await ffmpegEngine.isAvailable()) {
+          try {
+            onProgress?.('⬇️ Intercepted M3U8! Downloading via FFmpeg HLS engine...', 42);
+            const ffmpegResult = await ffmpegEngine.download(task, onProgress);
+            if (ffmpegResult.success && ffmpegResult.outputPath) {
+              return {
+                success: true,
+                outputPath: ffmpegResult.outputPath,
+                engineName: this.name,
+                details: {
+                  interceptedUrl: detectedStreamUrl,
+                  downloader: ffmpegEngine.name,
+                },
+              };
+            }
+          } catch (err: any) {
+            logger.warn(`FFmpeg pass failed on intercepted stream: ${err.message}`);
+          }
+        }
+
+        // Downstream Step 2: yt-dlp on intercepted stream
+        const ytdlpEngine = new YtdlpEngine();
+        if (await ytdlpEngine.isAvailable()) {
+          try {
+            onProgress?.('⬇️ Trying yt-dlp on intercepted M3U8 stream...', 55);
+            const ytdlpResult = await ytdlpEngine.download(task, onProgress);
+            if (ytdlpResult.success && ytdlpResult.outputPath) {
+              return {
+                success: true,
+                outputPath: ytdlpResult.outputPath,
+                engineName: this.name,
+                details: {
+                  interceptedUrl: detectedStreamUrl,
+                  downloader: ytdlpEngine.name,
+                },
+              };
+            }
+          } catch (err: any) {
+            logger.warn(`yt-dlp pass failed on intercepted stream: ${err.message}`);
+          }
+        }
+
+        // Downstream Step 3: Streamlink on intercepted stream
+        const streamlinkEngine = new StreamlinkEngine();
+        if (await streamlinkEngine.isAvailable()) {
+          try {
+            onProgress?.('⬇️ Trying Streamlink on intercepted M3U8 stream...', 70);
+            const slResult = await streamlinkEngine.download(task, onProgress);
+            if (slResult.success && slResult.outputPath) {
+              return {
+                success: true,
+                outputPath: slResult.outputPath,
+                engineName: this.name,
+                details: {
+                  interceptedUrl: detectedStreamUrl,
+                  downloader: streamlinkEngine.name,
+                },
+              };
+            }
+          } catch (err: any) {
+            logger.warn(`Streamlink pass failed on intercepted stream: ${err.message}`);
+          }
+        }
+
+        // Under NO circumstances report EXTRACTOR_UNSUPPORTED once M3U8 is intercepted
         return {
           success: false,
           engineName: this.name,
-          error: `Media intercepted (${detectedStreamUrl.slice(0, 60)}...), passing to downstream engine`,
-          details: { streamUrl: detectedStreamUrl, discoveredMediaCount: discoveredMedia.length },
+          error: `Downloader failed to assemble intercepted M3U8 (${detectedStreamUrl.slice(0, 60)}...)`,
+          errorType: 'NO_M3U8_FOUND',
         };
       }
 
@@ -257,3 +353,4 @@ export class PlaywrightEngine extends BaseEngine {
     }
   }
 }
+

@@ -10,8 +10,13 @@ import { DownloadTask, EngineResult, ErrorCategory } from '../types.ts';
 import { killTaskProcesses } from '../utils/cleaner.ts';
 import { logger } from '../logger.ts';
 
-function classifyError(errStr: string, explicitType?: ErrorCategory): ErrorCategory {
-  if (explicitType) return explicitType;
+function classifyError(errStr: string, explicitType?: ErrorCategory, hasStreamUrl = false): ErrorCategory {
+  if (explicitType) {
+    if (explicitType === 'EXTRACTOR_UNSUPPORTED' && hasStreamUrl) {
+      return 'NETWORK_ERROR';
+    }
+    return explicitType;
+  }
   const lower = errStr.toLowerCase();
   if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('abort')) {
     return 'TIMEOUT';
@@ -40,6 +45,9 @@ function classifyError(errStr: string, explicitType?: ErrorCategory): ErrorCateg
   }
   if (lower.includes('invalid') || lower.includes('corrupt') || lower.includes('truncated')) {
     return 'INVALID_MEDIA';
+  }
+  if (hasStreamUrl) {
+    return 'NETWORK_ERROR';
   }
   return 'EXTRACTOR_UNSUPPORTED';
 }
@@ -112,7 +120,8 @@ export class FallbackOrchestrator {
 
         // Failure on this engine -> Record, clean up, and continue to next engine
         const reason = result.error || 'Engine returned failure without message';
-        const errorCategory = classifyError(reason, result.errorType);
+        const hasStreamUrl = Boolean(task.streamUrl);
+        const errorCategory = classifyError(reason, result.errorType, hasStreamUrl);
 
         logger.taskError(task.id, engine.name, 'DOWNLOAD', errorCategory, reason);
         task.failedEngines.push({
@@ -133,7 +142,8 @@ export class FallbackOrchestrator {
       } catch (err: any) {
         const durationMs = Date.now() - engineStart;
         const errStr = err?.message || String(err);
-        const errorCategory = classifyError(errStr);
+        const hasStreamUrl = Boolean(task.streamUrl);
+        const errorCategory = classifyError(errStr, undefined, hasStreamUrl);
 
         logger.taskError(task.id, engine.name, 'DOWNLOAD', errorCategory, errStr);
         task.failedEngines.push({

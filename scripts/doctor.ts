@@ -396,13 +396,14 @@ async function runDoctor() {
     console.log(`  • Failure Cause:         ${healthResult.error || 'Chromium exited unexpectedly'}`);
 
     if (isPRoot || arch === 'arm64') {
-      console.log('\n\x1b[36m💡 Recommended Solution for PRoot / ARM64:\x1b[0m');
-      console.log('  1. Install system Chromium via apt in your Ubuntu container:');
-      console.log('     apt-get update && apt-get install -y chromium-browser');
-      console.log('  2. Once installed, verify with:');
-      console.log('     which chromium-browser');
-      console.log('  3. Add the path to your .env file:');
-      console.log('     echo "CHROMIUM_PATH=/usr/bin/chromium-browser" >> .env');
+      console.log('\n\x1b[36m💡 Recommended Solution for PRoot / ARM64 (Bypassing Snap wrapper):\x1b[0m');
+      console.log('  1. Run the automatic setup script:');
+      console.log('     bash scripts/setup.sh  (or: bash up.sh)');
+      console.log('  2. Or manually add Debian Bookworm repo & install native Chromium:');
+      console.log('     echo "deb [trusted=yes] http://deb.debian.org/debian bookworm main" > /etc/apt/sources.list.d/debian-bookworm.list');
+      console.log('     apt-get update && apt-get install -y --no-install-recommends chromium');
+      console.log('  3. Ensure CHROMIUM_PATH in .env:');
+      console.log('     echo "CHROMIUM_PATH=/usr/bin/chromium" >> .env');
       console.log('  4. Re-run: pnpm doctor\n');
     }
   } else {

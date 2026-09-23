@@ -11,6 +11,7 @@
     "doctor": "tsx scripts/doctor.ts",
     "login": "tsx scripts/login.ts",
     "test": "tsx scripts/test-pipeline.ts",
+    "up": "bash up.sh",
     "build": "tsc --noEmit",
     "lint": "tsc --noEmit"
   },
@@ -35,9 +36,10 @@
       "core-js",
       "es5-ext",
       "esbuild",
+      "playwright",
+      "playwright-core",
       "utf-8-validate"
     ]
-  }
+  },
+  "workspaces": ["."]
 }
-
-
