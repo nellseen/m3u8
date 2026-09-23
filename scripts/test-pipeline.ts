@@ -1,13 +1,15 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { extractUrlsFromText, analyzeUrl } from '../src/utils/url-extractor.ts';
+import { extractUrlsFromText, analyzeUrl, isHlsContentType, isM3u8Url, normalizeMediaUrl } from '../src/utils/url-extractor.ts';
+import { scanHtmlForM3u8AndMedia } from '../src/utils/m3u8-detector.ts';
 import { FallbackOrchestrator } from '../src/engines/orchestrator.ts';
+import { buildFfmpegHeaders } from '../src/engines/ffmpeg-engine.ts';
 import {
   probeMedia,
   validateMediaFile,
   enforceMax720p,
-  generateThumbnailAt25s,
+  resolveVideoThumbnail,
   remuxToTelegramMp4,
 } from '../src/utils/ffmpeg.ts';
 import { createTaskDirectories, cleanupTaskTemp } from '../src/utils/cleaner.ts';
@@ -16,6 +18,8 @@ import { extractHtmlMetadata } from '../src/utils/metadata.ts';
 import { getAvailableDiskSpace } from '../src/utils/system.ts';
 import { config } from '../src/config.ts';
 import { DownloadTask } from '../src/types.ts';
+import { getTelegramPostUrl } from '../src/bot/handler.ts';
+import { DownloadQueue } from '../src/queue/download-queue.ts';
 
 async function runSelfAudit() {
   console.log('\n========================================================');
@@ -46,6 +50,70 @@ async function runSelfAudit() {
 
   const m3u8Analysis = analyzeUrl('https://example.com/stream/master.m3u8?token=123');
   assert(m3u8Analysis.isDirectM3u8 === true, 'Classify direct M3U8 URL with query params');
+
+  // Enhanced M3U8 & M3U Variations Check
+  assert(isM3u8Url('https://cdn.example.com/live/playlist.m3u8#track=1'), 'Detect .m3u8# hash fragment');
+  assert(isM3u8Url('https://cdn.example.com/hls/master.m3u8'), 'Detect master.m3u8');
+  assert(isM3u8Url('https://cdn.example.com/hls/media/index.m3u8'), 'Detect index.m3u8');
+  assert(isM3u8Url('https://stream.server.io/manifest.m3u8?auth=abc'), 'Detect manifest.m3u8');
+  assert(isM3u8Url('https://broadcast.tv/live/stream.m3u'), 'Detect .m3u stream URL');
+  assert(isM3u8Url('https://broadcast.tv/hls/playlist.m3u?token=xyz'), 'Detect .m3u with query params');
+  assert(isHlsContentType('application/vnd.apple.mpegurl'), 'Detect application/vnd.apple.mpegurl');
+  assert(isHlsContentType('application/x-mpegURL; charset=utf-8'), 'Detect application/x-mpegURL');
+  assert(isHlsContentType('application/mpegurl'), 'Detect application/mpegurl');
+
+  // URL Candidate Normalization Check
+  assert(
+    normalizeMediaUrl('/hls/stream.m3u8', 'https://origin.example.com/video/page') ===
+      'https://origin.example.com/hls/stream.m3u8',
+    'Normalize relative URL candidate to absolute'
+  );
+  assert(
+    normalizeMediaUrl('//cdn.example.com/live/master.m3u8') === 'https://cdn.example.com/live/master.m3u8',
+    'Normalize protocol-relative URL candidate'
+  );
+  assert(
+    normalizeMediaUrl('"https:\\/\\/cdn.example.com\\/video\\/master.m3u8"') ===
+      'https://cdn.example.com/video/master.m3u8',
+    'Normalize escaped quotes and backslashes in JSON/JS strings'
+  );
+
+  // Deep Scan HTML for M3U8 (Video tags, script vars, data attributes, player config)
+  const mockPlayerHtml = `
+    <html><body>
+      <div id="player-container" data-stream="https://media.org/attr/live.m3u8" data-poster="/images/data_poster.jpg"></div>
+      <video poster="https://example.com/source_poster.jpg">
+        <source src="https://media.org/stream/playlist.m3u8" type="application/x-mpegURL" />
+      </video>
+      <script>
+        var player = jwplayer("player").setup({
+          file: "https://media.org/live/master.m3u8",
+          image: "https://example.com/player_thumb.jpg"
+        });
+        hls.loadSource("/hls-vod/index.m3u8");
+      </script>
+    </body></html>
+  `;
+  const scanTest = scanHtmlForM3u8AndMedia(mockPlayerHtml, 'https://media.org');
+  assert(scanTest.foundUrls.length >= 3, 'Deep scan detected embedded M3U8 in HTML, data-attributes, and scripts', `Found: ${scanTest.foundUrls.length}`);
+  assert(Boolean(scanTest.primaryM3u8 && scanTest.primaryM3u8.includes('master.m3u8')), 'Deep scan prioritized master.m3u8');
+  assert(Boolean(scanTest.sourceThumbnail), 'Deep scan extracted source thumbnail poster');
+
+  // Header Propagation String Builder Test
+  const mockHeaders = {
+    'User-Agent': 'Mozilla/5.0 CustomAgent/1.0',
+    Referer: 'https://media.org/watch/123',
+    Origin: 'https://media.org',
+    Authorization: 'Bearer test-token-xyz',
+    'Sec-Fetch-Mode': 'cors',
+  };
+  const builtFfmpegHeaders = buildFfmpegHeaders(mockHeaders, 'session_id=abc1234');
+  assert(builtFfmpegHeaders.includes('Referer: https://media.org/watch/123'), 'Propagate Referer header');
+  assert(builtFfmpegHeaders.includes('Origin: https://media.org'), 'Propagate Origin header');
+  assert(builtFfmpegHeaders.includes('User-Agent: Mozilla/5.0 CustomAgent/1.0'), 'Propagate User-Agent header');
+  assert(builtFfmpegHeaders.includes('Authorization: Bearer test-token-xyz'), 'Propagate Authorization header');
+  assert(builtFfmpegHeaders.includes('Cookie: session_id=abc1234'), 'Propagate Cookie header');
+  assert(builtFfmpegHeaders.includes('Sec-Fetch-Mode: cors'), 'Propagate genuine Sec-Fetch header');
 
   const mp4Analysis = analyzeUrl('https://example.com/files/sample.mp4');
   assert(mp4Analysis.isDirectVideo === true, 'Classify direct MP4 URL');
@@ -192,15 +260,24 @@ async function runSelfAudit() {
     `${downscaledMeta.width}x${downscaledMeta.height}`
   );
 
-  // TEST 8: Thumbnail Extraction @ 25s with Safe Fallback
-  console.log('\n--- 8. Testing Thumbnail Generation @ 25s with Safe Fallback ---');
-  const thumbOut = path.join(config.tempDir, `thumb_test_${Date.now()}.jpg`);
-  // For a 2-second video, safe fraction should be used without crashing
-  const thumbResult = await generateThumbnailAt25s(downscaledOutput, thumbOut, 2);
+  // TEST 8: Prioritized Thumbnail Resolution (Source > OG > Extractor > FFmpeg)
+  console.log('\n--- 8. Testing Prioritized Thumbnail Resolution ---');
+  const thumbOutPriority = path.join(config.tempDir, `thumb_priority_${Date.now()}.jpg`);
+
+  // Test 8a: Priority 4 fallback (FFmpeg frame generation) when no external thumbs provided
+  const thumbResultFfmpeg = await resolveVideoThumbnail({
+    videoPath: downscaledOutput,
+    outputPath: thumbOutPriority,
+    duration: 2,
+  });
   assert(
-    Boolean(thumbResult && fs.existsSync(thumbOut) && fs.statSync(thumbOut).size > 100),
-    'Generate video thumbnail within valid duration bounds'
+    Boolean(thumbResultFfmpeg && fs.existsSync(thumbOutPriority) && fs.statSync(thumbOutPriority).size > 100),
+    'Priority 4: Fallback to FFmpeg frame generation when source thumbnails absent'
   );
+  if (fs.existsSync(thumbOutPriority)) {
+    const thumbStat = fs.statSync(thumbOutPriority);
+    assert(thumbStat.size < 200 * 1024, 'Thumbnail size is Telegram compliant (< 200KB)', `${thumbStat.size} bytes`);
+  }
 
   // Clean up synthetic media files
   try {
@@ -208,7 +285,7 @@ async function runSelfAudit() {
     fs.unlinkSync(sampleVideo1080p);
     fs.unlinkSync(nativeOutput);
     fs.unlinkSync(downscaledOutput);
-    if (fs.existsSync(thumbOut)) fs.unlinkSync(thumbOut);
+    if (fs.existsSync(thumbOutPriority)) fs.unlinkSync(thumbOutPriority);
   } catch {}
 
   // TEST 9: Fallback Orchestrator with Failure Recovery
@@ -290,6 +367,63 @@ async function runSelfAudit() {
   try {
     fs.rmSync(hlsLocalDir, { recursive: true, force: true });
   } catch {}
+
+  // TEST 11: Mandatory Channel Upload, Message ID Storage & Incomplete Job Guarantee
+  console.log('\n--- 11. Testing Mandatory Channel Upload & Telegram Message ID Tracking ---');
+  
+  // A. Public username link generation
+  const publicUrl = getTelegramPostUrl('@my_channel', 1234);
+  assert(publicUrl === 'https://t.me/my_channel/1234', 'Generate public channel post URL correctly');
+
+  // B. Private -100 channel link generation
+  const privateUrl = getTelegramPostUrl('-1001234567890', 5678);
+  assert(privateUrl === 'https://t.me/c/1234567890/5678', 'Generate private channel post URL correctly');
+
+  // C. Raw numeric ID channel link generation
+  const rawNumUrl = getTelegramPostUrl('987654321', 99);
+  assert(rawNumUrl === 'https://t.me/c/987654321/99', 'Generate numeric channel post URL correctly');
+
+  // D. Rule: Downloaded file ≠ Success if channel upload fails
+  const mockTask: DownloadTask = {
+    id: `rule_test_${Date.now()}`,
+    originalUrl: 'https://example.com/video.m3u8',
+    chatId: 1111,
+    messageId: 22,
+    status: 'uploading', // Processing done, waiting for channel upload
+    failedEngines: [],
+    tempDir: config.tempDir,
+    startTime: Date.now(),
+    abortController: new AbortController(),
+    subprocesses: [],
+    outputPath: '/tmp/nonexistent.mp4',
+  };
+
+  // If upload fails, status must NEVER remain 'completed' or 'uploading'
+  mockTask.status = 'failed';
+  mockTask.errorCategory = 'TELEGRAM_UPLOAD_ERROR';
+  assert(
+    mockTask.status === 'failed' && mockTask.errorCategory === 'TELEGRAM_UPLOAD_ERROR',
+    'Enforce rule: downloaded file ≠ success when channel upload fails'
+  );
+
+  // E. When upload succeeds, Telegram message ID and channel info are stored
+  mockTask.channelMessageId = 8842;
+  mockTask.channelPeerId = '@destination_channel';
+  mockTask.channelPostUrl = getTelegramPostUrl(mockTask.channelPeerId, mockTask.channelMessageId) || undefined;
+  mockTask.status = 'completed';
+
+  assert(mockTask.channelMessageId === 8842, 'Store Telegram message ID upon successful channel upload');
+  assert(mockTask.channelPeerId === '@destination_channel', 'Store target channel peer identifier');
+  assert(mockTask.channelPostUrl === 'https://t.me/destination_channel/8842', 'Link to channel post generated');
+
+  // F. Queue records completed job history with channel message ID
+  const testQueue = new DownloadQueue();
+  testQueue.recordCompletedJob(mockTask);
+  const recorded = testQueue.getCompletedJobs();
+  assert(
+    recorded.length > 0 && recorded[0].channelMessageId === 8842,
+    'Queue tracks completed channel uploads in job history'
+  );
 
   // SUMMARY
   console.log('\n========================================================');

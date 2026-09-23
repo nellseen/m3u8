@@ -25,7 +25,7 @@ export interface MediaValidationResult {
 }
 
 /**
- * Detailed media probing using ffprobe JSON output with fallback to ffmpeg inspection.
+ * Probes media file using ffprobe with fallback to ffmpeg stderr inspection.
  */
 export async function probeMedia(filePath: string): Promise<MediaMetadata> {
   const meta: MediaMetadata = {};
@@ -113,7 +113,7 @@ export async function probeMedia(filePath: string): Promise<MediaMetadata> {
 }
 
 /**
- * Validates that the downloaded file is a genuine, playable video with valid streams and duration.
+ * Validates that the downloaded file is a genuine, playable video with valid streams.
  */
 export async function validateMediaFile(filePath: string): Promise<MediaValidationResult> {
   if (!fs.existsSync(filePath)) {
@@ -151,9 +151,6 @@ export async function validateMediaFile(filePath: string): Promise<MediaValidati
 
 /**
  * Enforces maximum 720p resolution without upscaling, preserving aspect ratio.
- * Landscape: max height 720 (scale=-2:720)
- * Portrait / Square: max height 720 preserving ratio
- * If height <= 720: do NOT upscale, maintain native resolution!
  */
 export async function enforceMax720p(
   inputPath: string,
@@ -268,117 +265,216 @@ export async function enforceMax720p(
 }
 
 /**
- * Generates thumbnail at the 25th second (or safe fraction if video is shorter than 25s).
- * Fallback to candidate thumbnail URL from metadata if FFmpeg frame capture fails.
+ * Normalizes an image file (downloaded or generated) to Telegram-compliant JPEG format:
+ * - Dimensions: max 320x320 preserving ratio
+ * - File size: strictly < 200 KB (Telegram thumb limit)
+ * - Format: JPEG (.jpg)
  */
-export async function generateThumbnailAt25s(
-  videoPath: string,
-  outputPath: string,
-  duration?: number,
-  fallbackCandidateUrl?: string
-): Promise<string | undefined> {
+export async function normalizeTelegramThumbnail(
+  rawImagePath: string,
+  normalizedPath: string
+): Promise<boolean> {
   const ffmpegBin = getFfmpegPath();
+  try {
+    if (!fs.existsSync(rawImagePath)) return false;
+    const stat = fs.statSync(rawImagePath);
+    if (stat.size < 50) return false;
 
-  // 1. Calculate timestamp around 00:00:25
-  let timestamp = '00:00:25.000';
-  if (duration && duration < 25) {
-    // If shorter than 25s, use 25% of duration or safe midpoint
-    const safeSec = Math.max(0.5, Math.min(duration - 0.5, duration * 0.25));
-    const mins = Math.floor(safeSec / 60);
-    const secs = (safeSec % 60).toFixed(3);
-    timestamp = `00:${mins.toString().padStart(2, '0')}:${secs.padStart(6, '0')}`;
+    // Use FFmpeg to transcode to standard progressive/baseline JPEG with max dimension 320px
+    await new Promise<boolean>((resolve) => {
+      const proc = spawn(
+        ffmpegBin,
+        [
+          '-y',
+          '-i',
+          rawImagePath,
+          '-vf',
+          'scale=320:320:force_original_aspect_ratio=decrease',
+          '-q:v',
+          '4',
+          normalizedPath,
+        ],
+        { stdio: 'ignore' }
+      );
+
+      proc.on('close', code => {
+        resolve(code === 0 && fs.existsSync(normalizedPath) && fs.statSync(normalizedPath).size > 100);
+      });
+      proc.on('error', () => resolve(false));
+    });
+
+    if (fs.existsSync(normalizedPath)) {
+      const normStat = fs.statSync(normalizedPath);
+      // Telegram requires thumbnail under 200KB. Scale=320 with q:v=4 is usually 10-35KB.
+      if (normStat.size > 0 && normStat.size < 200 * 1024) {
+        return true;
+      }
+    }
+  } catch (err: any) {
+    logger.warn(`normalizeTelegramThumbnail error: ${err.message || err}`);
   }
+  return false;
+}
 
-  logger.info(`Generating video thumbnail at timestamp ${timestamp} (duration: ${duration || 'unknown'}s)...`);
+/**
+ * Helper to download an external image URL and normalize to Telegram thumbnail
+ */
+async function downloadAndNormalizeImage(
+  imageUrl: string,
+  outputPath: string
+): Promise<string | undefined> {
+  if (!imageUrl || !imageUrl.startsWith('http')) return undefined;
 
-  const ffmpegSuccess = await new Promise<boolean>(resolve => {
-    const proc = spawn(
-      ffmpegBin,
-      [
-        '-y',
-        '-ss',
-        timestamp,
-        '-i',
-        videoPath,
-        '-vframes',
-        '1',
-        '-q:v',
-        '3',
-        '-vf',
-        'scale=320:-2',
-        outputPath,
-      ],
-      { stdio: 'ignore' }
-    );
-
-    proc.on('close', code => {
-      resolve(code === 0 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 100);
+  const rawTemp = `${outputPath}.raw_download`;
+  try {
+    logger.info(`[Thumbnail] Downloading external image candidate: ${imageUrl}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(imageUrl, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      },
     });
+    clearTimeout(timer);
 
-    proc.on('error', () => {
-      resolve(false);
-    });
-  });
-
-  if (ffmpegSuccess) {
-    return outputPath;
-  }
-
-  // 2. Fallback: try capturing frame at 0.5s if 25s failed (e.g. keyframe seek issue)
-  const initialFrameSuccess = await new Promise<boolean>(resolve => {
-    const proc = spawn(
-      ffmpegBin,
-      [
-        '-y',
-        '-ss',
-        '00:00:00.500',
-        '-i',
-        videoPath,
-        '-vframes',
-        '1',
-        '-q:v',
-        '3',
-        '-vf',
-        'scale=320:-2',
-        outputPath,
-      ],
-      { stdio: 'ignore' }
-    );
-
-    proc.on('close', code => {
-      resolve(code === 0 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 100);
-    });
-
-    proc.on('error', () => {
-      resolve(false);
-    });
-  });
-
-  if (initialFrameSuccess) {
-    return outputPath;
-  }
-
-  // 3. Fallback: download web/OpenGraph thumbnail candidate if available
-  if (fallbackCandidateUrl && fallbackCandidateUrl.startsWith('http')) {
-    try {
-      logger.info(`FFmpeg thumbnail failed, falling back to metadata thumbnail: ${fallbackCandidateUrl}`);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 6000);
-      const res = await fetch(fallbackCandidateUrl, { signal: controller.signal });
-      clearTimeout(timer);
-
-      if (res.ok) {
-        const buffer = Buffer.from(await res.arrayBuffer());
-        if (buffer.length > 200) {
-          fs.writeFileSync(outputPath, buffer);
+    if (res.ok) {
+      const buffer = Buffer.from(await res.arrayBuffer());
+      if (buffer.length > 200) {
+        fs.writeFileSync(rawTemp, buffer);
+        const normalized = await normalizeTelegramThumbnail(rawTemp, outputPath);
+        try { fs.unlinkSync(rawTemp); } catch {}
+        if (normalized && fs.existsSync(outputPath)) {
           return outputPath;
         }
       }
-    } catch {
-      // Ignore fallback download errors
+    }
+  } catch (err: any) {
+    logger.debug(`[Thumbnail] Download failed for candidate ${imageUrl}: ${err.message}`);
+  } finally {
+    try { if (fs.existsSync(rawTemp)) fs.unlinkSync(rawTemp); } catch {}
+  }
+
+  return undefined;
+}
+
+/**
+ * Generates frame directly from video at specific timestamp using FFmpeg
+ */
+export async function captureVideoFrame(
+  videoPath: string,
+  outputPath: string,
+  timestampStr: string
+): Promise<boolean> {
+  const ffmpegBin = getFfmpegPath();
+  return new Promise<boolean>(resolve => {
+    const proc = spawn(
+      ffmpegBin,
+      [
+        '-y',
+        '-ss',
+        timestampStr,
+        '-i',
+        videoPath,
+        '-vframes',
+        '1',
+        '-q:v',
+        '3',
+        '-vf',
+        'scale=320:320:force_original_aspect_ratio=decrease',
+        outputPath,
+      ],
+      { stdio: 'ignore' }
+    );
+
+    proc.on('close', code => {
+      resolve(code === 0 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 100);
+    });
+
+    proc.on('error', () => resolve(false));
+  });
+}
+
+/**
+ * Resolves Thumbnail according to strict priority requirements:
+ * 1. Thumbnail source (video poster, direct player source image)
+ * 2. OpenGraph image (og:image, twitter:image)
+ * 3. Extractor thumbnail (yt-dlp, streamlink, json-ld)
+ * 4. Generate frame from video using FFmpeg (25s or safe fraction, with 0.5s fallback)
+ *
+ * Guarantees:
+ * - Format strictly compatible with Telegram (JPEG, <= 320x320, < 200KB)
+ * - Safe sizes that will not cause upload failure
+ * - Non-fatal: if all thumbnail attempts fail, returns undefined rather than failing video upload
+ */
+export async function resolveVideoThumbnail(options: {
+  videoPath: string;
+  outputPath: string;
+  duration?: number;
+  sourceThumbnail?: string;
+  ogImage?: string;
+  extractorThumbnail?: string;
+}): Promise<string | undefined> {
+  const { videoPath, outputPath, duration, sourceThumbnail, ogImage, extractorThumbnail } = options;
+
+  logger.info('[Thumbnail] Resolving thumbnail with strict priority: 1.Source -> 2.OG -> 3.Extractor -> 4.FFmpeg');
+
+  // Priority 1: Thumbnail Source (Player Poster / Video Poster / Page Source)
+  if (sourceThumbnail) {
+    const res = await downloadAndNormalizeImage(sourceThumbnail, outputPath);
+    if (res) {
+      logger.info(`[Thumbnail] Resolved via Priority 1 (Source Thumbnail): ${sourceThumbnail}`);
+      return res;
     }
   }
 
+  // Priority 2: OpenGraph Image (og:image, twitter:image)
+  if (ogImage) {
+    const res = await downloadAndNormalizeImage(ogImage, outputPath);
+    if (res) {
+      logger.info(`[Thumbnail] Resolved via Priority 2 (OpenGraph Image): ${ogImage}`);
+      return res;
+    }
+  }
+
+  // Priority 3: Extractor Thumbnail (yt-dlp, streamlink, json-ld)
+  if (extractorThumbnail) {
+    const res = await downloadAndNormalizeImage(extractorThumbnail, outputPath);
+    if (res) {
+      logger.info(`[Thumbnail] Resolved via Priority 3 (Extractor Thumbnail): ${extractorThumbnail}`);
+      return res;
+    }
+  }
+
+  // Priority 4: Generate frame from video using FFmpeg
+  if (fs.existsSync(videoPath)) {
+    // 4a. Calculate timestamp around 25th second (or 25% if shorter than 25s)
+    let timestamp = '00:00:25.000';
+    if (duration && duration < 25) {
+      const safeSec = Math.max(0.5, Math.min(duration - 0.5, duration * 0.25));
+      const mins = Math.floor(safeSec / 60);
+      const secs = (safeSec % 60).toFixed(3);
+      timestamp = `00:${mins.toString().padStart(2, '0')}:${secs.padStart(6, '0')}`;
+    }
+
+    logger.info(`[Thumbnail] Generating frame from video at ${timestamp} (duration: ${duration || 'unknown'}s)...`);
+    const frameSuccess = await captureVideoFrame(videoPath, outputPath, timestamp);
+    if (frameSuccess) {
+      logger.info('[Thumbnail] Resolved via Priority 4 (FFmpeg frame capture at 25s/ratio)');
+      return outputPath;
+    }
+
+    // 4b. Frame capture fallback: seek to 00:00:00.500 if 25s failed (e.g. keyframe seek issue)
+    const fallbackFrame = await captureVideoFrame(videoPath, outputPath, '00:00:00.500');
+    if (fallbackFrame) {
+      logger.info('[Thumbnail] Resolved via Priority 4 (FFmpeg frame capture at 0.5s fallback)');
+      return outputPath;
+    }
+  }
+
+  logger.warn('[Thumbnail] All thumbnail candidates failed. Proceeding without thumbnail (non-fatal).');
   return undefined;
 }
 

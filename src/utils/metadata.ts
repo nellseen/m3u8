@@ -1,6 +1,7 @@
 import * as cheerio from 'cheerio';
 import { ExtractedMetadata } from '../types.ts';
 import { ensureIndonesianTitle } from './translator.ts';
+import { scanHtmlForM3u8AndMedia } from './m3u8-detector.ts';
 import { logger } from '../logger.ts';
 
 export async function extractHtmlMetadata(html: string, pageUrl: string): Promise<ExtractedMetadata> {
@@ -18,7 +19,7 @@ export async function extractHtmlMetadata(html: string, pageUrl: string): Promis
   try {
     const $ = cheerio.load(html);
 
-    // 1. JSON-LD metadata
+    // 1. JSON-LD metadata (Priority 3: Extractor thumbnail)
     $('script[type="application/ld+json"]').each((_, el) => {
       try {
         const text = $(el).html() || '';
@@ -34,8 +35,8 @@ export async function extractHtmlMetadata(html: string, pageUrl: string): Promis
             if (!meta.description && video.description) {
               meta.description = String(video.description).trim();
             }
-            if (!meta.thumbnail && video.thumbnailUrl) {
-              meta.thumbnail = Array.isArray(video.thumbnailUrl) ? video.thumbnailUrl[0] : String(video.thumbnailUrl);
+            if (!meta.extractorThumbnail && video.thumbnailUrl) {
+              meta.extractorThumbnail = Array.isArray(video.thumbnailUrl) ? video.thumbnailUrl[0] : String(video.thumbnailUrl);
             }
             if (!meta.duration && video.duration) {
               // Parse ISO 8601 duration e.g. PT1M30S
@@ -54,7 +55,7 @@ export async function extractHtmlMetadata(html: string, pageUrl: string): Promis
       }
     });
 
-    // 2. OpenGraph & Twitter tags
+    // 2. OpenGraph & Twitter tags (Priority 2: ogImage)
     const ogTitle = $('meta[property="og:title"]').attr('content') || $('meta[name="twitter:title"]').attr('content');
     const ogDesc = $('meta[property="og:description"]').attr('content') || $('meta[name="twitter:description"]').attr('content');
     const ogImage = $('meta[property="og:image"]').attr('content') || $('meta[name="twitter:image"]').attr('content');
@@ -66,8 +67,8 @@ export async function extractHtmlMetadata(html: string, pageUrl: string): Promis
     if (!meta.description && ogDesc) {
       meta.description = ogDesc.trim();
     }
-    if (!meta.thumbnail && ogImage) {
-      meta.thumbnail = ogImage.trim();
+    if (ogImage) {
+      meta.ogImage = ogImage.trim();
     }
     if (ogSite && !meta.domain) {
       meta.domain = ogSite.trim();
@@ -87,29 +88,42 @@ export async function extractHtmlMetadata(html: string, pageUrl: string): Promis
       }
     }
 
-    // 4. Video element attributes
+    // 4. Video & Source element attributes (Priority 1: sourceThumbnail)
     $('video').each((_, el) => {
-      const poster = $(el).attr('poster');
-      if (poster && !meta.thumbnail) {
+      const poster = $(el).attr('poster') || $(el).attr('data-poster');
+      if (poster && !meta.sourceThumbnail) {
         try {
-          meta.thumbnail = new URL(poster, pageUrl).toString();
+          meta.sourceThumbnail = new URL(poster, pageUrl).toString();
         } catch {
-          meta.thumbnail = poster;
+          meta.sourceThumbnail = poster;
         }
       }
     });
+
+    // 5. Deep Scan for player configurations & script posters
+    const deepScan = scanHtmlForM3u8AndMedia(html, pageUrl);
+    if (!meta.sourceThumbnail && deepScan.sourceThumbnail) {
+      meta.sourceThumbnail = deepScan.sourceThumbnail;
+    }
+
+    // Resolve unified thumbnail candidate according to strict user priorities:
+    // 1. Thumbnail source
+    // 2. OpenGraph image
+    // 3. Extractor thumbnail
+    meta.thumbnail = meta.sourceThumbnail || meta.ogImage || meta.extractorThumbnail;
+
   } catch (err: any) {
     logger.warn('Error parsing HTML metadata:', err.message || err);
   }
 
-  // 5. Clean up title (remove trailing site identifiers like " - YouTube", " | Website")
+  // Clean up title
   if (meta.originalTitle) {
     meta.originalTitle = meta.originalTitle
       .replace(/\s*[-|–—]\s*(YouTube|Twitter|X|Vimeo|TikTok|Dailymotion|Twitch).*$/i, '')
       .trim();
   }
 
-  // 6. Translate foreign title to Indonesian
+  // Translate foreign title to Indonesian
   if (meta.originalTitle) {
     const trans = await ensureIndonesianTitle(meta.originalTitle);
     meta.translatedTitle = trans.translatedTitle;

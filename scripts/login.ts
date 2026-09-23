@@ -1,7 +1,7 @@
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import input from 'input';
-import { config, isConfigured, saveApiCredentials, saveSessionString } from '../src/config.ts';
+import { config, isConfigured, saveApiCredentials, saveSessionString, saveTargetChannel } from '../src/config.ts';
 
 async function login() {
   console.log('\n======================================================');
@@ -57,6 +57,22 @@ async function login() {
 
   const me = await client.getMe();
   console.log(`Akun aktif: ${(me as any).firstName} (@${(me as any).username || (me as any).id})`);
+
+  // Mandatory TARGET_CHANNEL_ID configuration
+  if (!config.targetChannelId) {
+    console.log('\n📢 TARGET_CHANNEL_ID (Wajib untuk pengiriman video otomatis):');
+    console.log('   Format: @namachannel atau -100xxxxxxxxxx');
+    const enteredChannel = await input.text('Masukkan TARGET_CHANNEL_ID Anda: ');
+    if (enteredChannel.trim()) {
+      saveTargetChannel(enteredChannel.trim());
+      console.log(`✅ [OK] TARGET_CHANNEL_ID berhasil disimpan ke .env: ${enteredChannel.trim()}`);
+    } else {
+      console.log('⚠️ Peringatan: TARGET_CHANNEL_ID belum diisi. Anda harus mengisinya di .env sebelum bot dapat mengunggah video.');
+    }
+  } else {
+    console.log(`📢 Target channel terkonfigurasi: ${config.targetChannelId}`);
+  }
+
   console.log('\n🚀 Sekarang Anda dapat langsung menjalankan bot dengan: pnpm start\n');
 
   await client.disconnect();

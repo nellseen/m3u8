@@ -350,6 +350,19 @@ async function runDoctor() {
     };
   });
 
+  check('Telegram', 'Target Channel (Upload Target)', () => {
+    const hasChannel = Boolean(config.targetChannelId && config.targetChannelId.trim());
+    if (hasChannel) {
+      return { pass: true, details: `Target: ${config.targetChannelId.trim()}` };
+    }
+    return {
+      pass: false,
+      warn: true,
+      details: 'TARGET_CHANNEL_ID not set in .env (Mandatory)',
+      remedy: 'Set TARGET_CHANNEL_ID in .env or run "pnpm run login" to configure channel destination.',
+    };
+  });
+
   // Print Formatted Output Table
   console.log('--------------------------------------------------------------------------------------------------');
   console.log('| Status | Category       | Check Name                          | Details                        |');

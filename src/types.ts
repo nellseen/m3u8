@@ -55,7 +55,10 @@ export interface ExtractedMetadata {
   audioCodec?: string;
   fps?: number;
   filesize?: number;
-  thumbnail?: string; // candidate image url or local path
+  thumbnail?: string; // resolved best candidate
+  sourceThumbnail?: string; // Priority 1: direct source/poster/player thumbnail
+  ogImage?: string; // Priority 2: OpenGraph or Twitter meta image
+  extractorThumbnail?: string; // Priority 3: Extractor thumbnail (yt-dlp/streamlink/json-ld)
   detectedLanguage?: string;
   translationStatus?: 'not_needed' | 'translated' | 'failed';
 }
@@ -114,6 +117,9 @@ export interface DownloadTask {
   abortController: AbortController;
   subprocesses: number[]; // PIDs to kill on cancel/cleanup
   errorCategory?: ErrorCategory;
+  channelMessageId?: number;
+  channelPeerId?: string;
+  channelPostUrl?: string;
 }
 
 export interface DoctorCheckItem {
@@ -168,6 +174,7 @@ export interface BotConfig {
   autoDownloadPrivate: boolean;
   autoDownloadGroups: boolean;
   commandPrefix: string;
+  targetChannelId: string;
   customPaths: {
     ffmpeg?: string;
     ytdlp?: string;

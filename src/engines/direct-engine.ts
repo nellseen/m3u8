@@ -2,10 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
 import { finished } from 'stream/promises';
-import * as cheerio from 'cheerio';
 import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
-import { analyzeUrl } from '../utils/url-extractor.ts';
+import { analyzeUrl, isHlsContentType, normalizeMediaUrl } from '../utils/url-extractor.ts';
+import { scanHtmlForM3u8AndMedia } from '../utils/m3u8-detector.ts';
 import { remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
 import { formatBytes } from '../utils/system.ts';
 import { extractHtmlMetadata } from '../utils/metadata.ts';
@@ -16,7 +16,7 @@ export class DirectEngine extends BaseEngine {
   readonly priority = 1;
 
   async isAvailable(): Promise<boolean> {
-    return true; // Native fetch and cheerio
+    return true; // Native fetch and parser
   }
 
   async download(
@@ -28,7 +28,7 @@ export class DirectEngine extends BaseEngine {
     const downloadDir = task.subDirs?.download || task.tempDir;
 
     try {
-      // 1. Direct HLS (.m3u8) check
+      // 1. Direct HLS (.m3u8, .m3u, query, hash, manifest, master) check
       if (urlInfo.isDirectM3u8) {
         onProgress?.('🔎 Direct M3U8 detected, delegating to HLS pipeline...', 20);
         task.streamUrl = targetUrl;
@@ -60,8 +60,8 @@ export class DirectEngine extends BaseEngine {
         }
       }
 
-      // 3. Web Page Inspection via Cheerio
-      onProgress?.('🌐 Inspecting page HTML for media & HLS playlists...', 10);
+      // 3. Web Page Inspection via Deep HTTP & HTML Analysis
+      onProgress?.('🌐 Inspecting page HTTP response & deep HTML for M3U8 playlists...', 10);
       
       const timeoutController = new AbortController();
       const fetchTimer = setTimeout(() => timeoutController.abort(), 15000);
@@ -69,14 +69,22 @@ export class DirectEngine extends BaseEngine {
       const abortHandler = () => timeoutController.abort();
       task.abortController.signal.addEventListener('abort', abortHandler, { once: true });
 
+      const requestHeaders: Record<string, string> = {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,application/vnd.apple.mpegurl,application/x-mpegURL,application/mpegurl,video/*,*/*;q=0.8',
+        Referer: targetUrl,
+      };
+
+      try {
+        requestHeaders['Origin'] = new URL(targetUrl).origin;
+      } catch {}
+
       let res: globalThis.Response;
       try {
         res = await fetch(targetUrl, {
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,video/*,*/*;q=0.8',
-          },
+          headers: requestHeaders,
           signal: timeoutController.signal,
         });
       } finally {
@@ -84,17 +92,27 @@ export class DirectEngine extends BaseEngine {
         task.abortController.signal.removeEventListener('abort', abortHandler);
       }
 
+      // Capture Set-Cookie if any returned
+      const setCookie = res.headers.get('set-cookie');
+      if (setCookie && !task.cookies) {
+        task.cookies = setCookie.split(';')[0];
+      }
+
+      // Check HTTP Response Content-Type:
+      // application/vnd.apple.mpegurl, application/x-mpegURL, application/mpegurl
       const contentType = res.headers.get('content-type') || '';
-      if (
-        contentType.includes('application/x-mpegurl') ||
-        contentType.includes('vnd.apple.mpegurl') ||
-        contentType.includes('application/vnd.apple.mpegurl')
-      ) {
+      if (isHlsContentType(contentType)) {
+        logger.info(`Engine 1: HTTP Content-Type indicates HLS stream (${contentType}) at ${targetUrl}`);
         task.streamUrl = targetUrl;
+        task.streamHeaders = {
+          'user-agent': requestHeaders['User-Agent'],
+          referer: targetUrl,
+          origin: requestHeaders['Origin'],
+        };
         return {
           success: false,
           engineName: this.name,
-          error: 'Content-type indicates HLS stream, passing to FFmpeg HLS engine',
+          error: `Content-type (${contentType}) indicates HLS stream, passing to FFmpeg HLS engine`,
           errorType: 'NO_M3U8_FOUND',
         };
       }
@@ -122,41 +140,60 @@ export class DirectEngine extends BaseEngine {
       // Parse HTML
       const html = await res.text();
 
-      // Extract metadata if not already extracted
+      // Check if raw response text is actually an M3U8 playlist (e.g. starts with #EXTM3U)
+      if (html.trim().startsWith('#EXTM3U')) {
+        logger.info(`Engine 1: URL returned raw M3U8 playlist content: ${targetUrl}`);
+        task.streamUrl = targetUrl;
+        task.streamHeaders = {
+          'user-agent': requestHeaders['User-Agent'],
+          referer: targetUrl,
+          origin: requestHeaders['Origin'],
+        };
+        return {
+          success: false,
+          engineName: this.name,
+          error: 'Response body is raw M3U8 playlist, proceeding to HLS engine',
+          errorType: 'NO_M3U8_FOUND',
+        };
+      }
+
+      // Extract metadata with strict thumbnail priorities
       if (!task.metadata || !task.metadata.originalTitle) {
         task.metadata = await extractHtmlMetadata(html, targetUrl);
       }
 
-      const $ = cheerio.load(html);
+      // Deep M3U8 scan: <source>, <video>, <link preload>, data attributes, embedded JSON, JS variables, player configs
+      const scanResult = scanHtmlForM3u8AndMedia(html, targetUrl);
+      if (scanResult.primaryM3u8) {
+        logger.info(`Engine 1 deep scan discovered M3U8: ${scanResult.primaryM3u8}`);
+        task.streamUrl = scanResult.primaryM3u8;
+        task.streamHeaders = {
+          'user-agent': requestHeaders['User-Agent'],
+          referer: targetUrl,
+          origin: requestHeaders['Origin'],
+        };
 
-      // Look for video or source tags
-      let detectedMediaUrl = '';
-      $('video, source').each((_, el) => {
-        const src = $(el).attr('src');
-        if (src && (src.includes('.m3u8') || src.includes('.mp4') || src.includes('.webm'))) {
-          try {
-            detectedMediaUrl = new URL(src, targetUrl).href;
-            return false;
-          } catch {}
+        if (!task.discoveredMedia) {
+          task.discoveredMedia = [];
         }
-      });
-
-      // Look for regex matches inside script tags
-      if (!detectedMediaUrl) {
-        const scriptContents = $('script').map((_, el) => $(el).html()).get().join('\n');
-        const m3u8Match = scriptContents.match(/(https?:\/\/[^"'\\s\s]+\.m3u8[^"'\\s\s]*)/i);
-        if (m3u8Match) {
-          detectedMediaUrl = m3u8Match[1].replace(/\\/g, '');
+        for (const u of scanResult.foundUrls) {
+          task.discoveredMedia.push({
+            streamUrl: u,
+            isHls: true,
+            headers: { ...task.streamHeaders },
+          });
         }
-      }
 
-      if (detectedMediaUrl) {
-        logger.info(`Engine 1 extracted media URL: ${detectedMediaUrl}`);
-        task.streamUrl = detectedMediaUrl;
+        if (scanResult.sourceThumbnail && (!task.metadata || !task.metadata.sourceThumbnail)) {
+          if (!task.metadata) task.metadata = {};
+          task.metadata.sourceThumbnail = scanResult.sourceThumbnail;
+          if (!task.metadata.thumbnail) task.metadata.thumbnail = scanResult.sourceThumbnail;
+        }
+
         return {
           success: false,
           engineName: this.name,
-          error: `Extracted media URL (${detectedMediaUrl.slice(0, 60)}...), proceeding to downstream engines`,
+          error: `Extracted M3U8 URL (${scanResult.primaryM3u8.slice(0, 60)}...), proceeding to downstream engines`,
           errorType: 'NO_M3U8_FOUND',
         };
       }
@@ -164,7 +201,7 @@ export class DirectEngine extends BaseEngine {
       return {
         success: false,
         engineName: this.name,
-        error: 'No direct video stream or static M3U8 found in HTML tags',
+        error: 'No direct video stream or static M3U8 found in HTML tags/scripts',
         errorType: 'NO_MEDIA_FOUND',
       };
     } catch (err: any) {

@@ -5,6 +5,7 @@ import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
 import { getFfmpegPath } from '../utils/system.ts';
 import { validateMediaFile, remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
+import { buildFfmpegHeaders } from './ffmpeg-engine.ts';
 import { logger } from '../logger.ts';
 
 export class RetryEngine extends BaseEngine {
@@ -55,20 +56,10 @@ export class RetryEngine extends BaseEngine {
             'file,http,https,tcp,tls,crypto,data',
           ];
 
-          if (task.streamHeaders) {
-            let headerStr = '';
-            if (task.streamHeaders['referer']) {
-              headerStr += `Referer: ${task.streamHeaders['referer']}\r\n`;
-            }
-            if (task.streamHeaders['user-agent']) {
-              headerStr += `User-Agent: ${task.streamHeaders['user-agent']}\r\n`;
-            }
-            if (task.cookies) {
-              headerStr += `Cookie: ${task.cookies}\r\n`;
-            }
-            if (headerStr) {
-              args.push('-headers', headerStr);
-            }
+          // Contextual header propagation
+          const headerStr = buildFfmpegHeaders(task.streamHeaders, task.cookies);
+          if (headerStr) {
+            args.push('-headers', headerStr);
           }
 
           args.push(
@@ -110,28 +101,28 @@ export class RetryEngine extends BaseEngine {
           });
         });
 
-        if (success) {
+        if (success && fs.existsSync(outputPath)) {
           const validation = await validateMediaFile(outputPath);
           if (validation.valid) {
-            logger.info(`[Engine 6] Successfully recovered media with candidate: ${candidateUrl}`);
+            logger.info(`[Engine 6] Successfully recovered media using candidate: ${candidateUrl}`);
             return {
               success: true,
               outputPath,
               engineName: this.name,
+              streamUrl: candidateUrl,
             };
           }
-          try { fs.unlinkSync(outputPath); } catch {}
         }
       } catch (err: any) {
-        logger.warn(`[Engine 6] Candidate ${candidateUrl} failed: ${err.message}`);
+        logger.warn(`Candidate ${candidateUrl} failed in Engine 6: ${err.message}`);
       }
     }
 
     return {
       success: false,
       engineName: this.name,
-      error: 'All discovered media retry candidates failed to assemble a valid video',
-      errorType: 'INVALID_MEDIA',
+      error: `All ${uniqueCandidates.length} discovered media retry candidates failed`,
+      errorType: 'NO_MEDIA_FOUND',
     };
   }
 }

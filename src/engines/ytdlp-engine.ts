@@ -4,7 +4,7 @@ import path from 'path';
 import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
 import { getYtdlpPath, getFfmpegPath } from '../utils/system.ts';
-import { remuxToTelegramMp4, validateMediaFile } from '../utils/ffmpeg.ts';
+import { validateMediaFile, remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
 import { ensureIndonesianTitle } from '../utils/translator.ts';
 import { logger } from '../logger.ts';
 
@@ -41,6 +41,7 @@ export class YtdlpEngine extends BaseEngine {
     const args: string[] = [
       '--no-playlist',
       '--no-warnings',
+      '--write-info-json',
       '--ffmpeg-location',
       ffmpegBin,
       '-f',
@@ -55,17 +56,43 @@ export class YtdlpEngine extends BaseEngine {
       outputPattern,
     ];
 
+    // Contextual Header Propagation
     if (task.streamHeaders) {
-      if (task.streamHeaders['referer']) {
-        args.push('--referer', task.streamHeaders['referer']);
+      const lowerHeaders: Record<string, string> = {};
+      for (const [k, v] of Object.entries(task.streamHeaders)) {
+        lowerHeaders[k.toLowerCase()] = v;
       }
-      if (task.streamHeaders['user-agent']) {
-        args.push('--user-agent', task.streamHeaders['user-agent']);
+
+      if (lowerHeaders['referer']) {
+        args.push('--referer', lowerHeaders['referer']);
+      }
+      if (lowerHeaders['user-agent']) {
+        args.push('--user-agent', lowerHeaders['user-agent']);
+      }
+
+      // Propagate Origin, Authorization, Accept, Accept-Language, Sec-Fetch-* if genuine
+      const passthroughKeys = [
+        'origin',
+        'authorization',
+        'accept',
+        'accept-language',
+        'sec-fetch-dest',
+        'sec-fetch-mode',
+        'sec-fetch-site',
+      ];
+
+      for (const key of passthroughKeys) {
+        if (lowerHeaders[key]) {
+          const capitalizedKey = key
+            .split('-')
+            .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+            .join('-');
+          args.push('--add-header', `${capitalizedKey}:${lowerHeaders[key]}`);
+        }
       }
     }
 
     if (task.cookies) {
-      // Pass cookies header if available
       args.push('--add-header', `Cookie:${task.cookies}`);
     }
 
@@ -90,12 +117,10 @@ export class YtdlpEngine extends BaseEngine {
         );
         if (match && onProgress) {
           const percent = parseFloat(match[1]);
-          const size = match[2];
+          const total = match[2];
           const speed = match[3];
           const eta = match[4] || '';
-          onProgress(`⬇️ yt-dlp: ${percent.toFixed(1)}% of ${size} (${speed}${eta ? ` ETA ${eta}` : ''})`, percent);
-        } else if (line.includes('[Merger]') || line.includes('[ffmpeg]')) {
-          onProgress?.('⚙️ Merging audio and video streams...', 90);
+          onProgress(`⬇️ yt-dlp: ${percent}% of ${total} (${speed})${eta ? ` ETA: ${eta}` : ''}`, percent);
         }
       });
 
@@ -114,57 +139,78 @@ export class YtdlpEngine extends BaseEngine {
       proc.on('close', async code => {
         task.abortController.signal.removeEventListener('abort', abortHandler);
 
-        // Find matched downloaded file in downloadDir
-        const files = fs.readdirSync(downloadDir);
-        const downloadedFile = files.find(
-          f => f.startsWith('ytdlp_raw_') && !f.endsWith('.part') && !f.endsWith('.ytdl')
-        );
+        if (code === 0) {
+          // Find downloaded file
+          const files = fs.readdirSync(downloadDir);
+          const rawFile = files.find(
+            f =>
+              f.startsWith('ytdlp_raw_') &&
+              !f.endsWith('.part') &&
+              !f.endsWith('.ytdl') &&
+              !f.endsWith('.json')
+          );
 
-        if (code === 0 && downloadedFile) {
-          const rawPath = path.join(downloadDir, downloadedFile);
-
-          onProgress?.('⚙️ Normalizing video container with FFmpeg...', 92);
-          try {
+          if (rawFile) {
+            const rawPath = path.join(downloadDir, rawFile);
+            onProgress?.('⚙️ Remuxing yt-dlp output to Telegram MP4 format...', 85);
             await remuxToTelegramMp4(rawPath, finalMp4);
-
-            const validation = await validateMediaFile(finalMp4);
-            if (!validation.valid) {
-              try { fs.unlinkSync(finalMp4); } catch {}
-              resolve({
-                success: false,
-                engineName: this.name,
-                error: `yt-dlp output failed validation: ${validation.error}`,
-                errorType: 'INVALID_MEDIA',
-              });
-              return;
-            }
 
             // Cleanup raw download
             try { fs.unlinkSync(rawPath); } catch {}
+
+            // Parse yt-dlp info.json if generated
+            const jsonFile = files.find(f => f.startsWith('ytdlp_raw_') && f.endsWith('.info.json'));
+            if (jsonFile) {
+              try {
+                const jsonPath = path.join(downloadDir, jsonFile);
+                const infoData = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+                if (!task.metadata) task.metadata = {};
+
+                if (infoData.title && !task.metadata.originalTitle) {
+                  task.metadata.originalTitle = String(infoData.title).trim();
+                  const trans = await ensureIndonesianTitle(task.metadata.originalTitle);
+                  task.metadata.translatedTitle = trans.translatedTitle;
+                  task.metadata.detectedLanguage = trans.detectedLanguage;
+                  task.metadata.translationStatus = trans.translationStatus;
+                }
+                if (infoData.thumbnail && !task.metadata.extractorThumbnail) {
+                  task.metadata.extractorThumbnail = String(infoData.thumbnail);
+                  if (!task.metadata.thumbnail) task.metadata.thumbnail = String(infoData.thumbnail);
+                }
+                if (infoData.duration && !task.metadata.duration) {
+                  task.metadata.duration = Math.round(Number(infoData.duration));
+                }
+                try { fs.unlinkSync(jsonPath); } catch {}
+              } catch {
+                // Ignore info json parsing error
+              }
+            }
 
             resolve({
               success: true,
               outputPath: finalMp4,
               engineName: this.name,
             });
-          } catch (err: any) {
-            resolve({
-              success: false,
-              engineName: this.name,
-              error: `yt-dlp remux post-processing failed: ${err.message}`,
-              errorType: 'FFMPEG_ERROR',
-            });
+            return;
           }
-        } else {
-          const errMsg = stderr || stdout || `Process exited with code ${code}`;
-          logger.warn(`yt-dlp failed: ${errMsg.slice(-250)}`);
-          resolve({
-            success: false,
-            engineName: this.name,
-            error: errMsg.slice(0, 300),
-            errorType: 'EXTRACTOR_UNSUPPORTED',
-          });
         }
+
+        const errMsg = stderr || stdout || `Process exited with code ${code}`;
+        logger.warn(`yt-dlp failed: ${errMsg.slice(-250)}`);
+
+        let errorType: any = 'PROCESS_ERROR';
+        if (errMsg.includes('Unsupported URL') || errMsg.includes('no suitable extractor')) {
+          errorType = 'EXTRACTOR_UNSUPPORTED';
+        } else if (errMsg.includes('HTTP Error 403') || errMsg.includes('Forbidden')) {
+          errorType = 'NETWORK_ERROR';
+        }
+
+        resolve({
+          success: false,
+          engineName: this.name,
+          error: errMsg.slice(0, 300),
+          errorType,
+        });
       });
 
       proc.on('error', err => {

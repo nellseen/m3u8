@@ -5,7 +5,7 @@ import { DownloadTask, DownloadStatus } from '../types.ts';
 import { config } from '../config.ts';
 import { FallbackOrchestrator } from '../engines/orchestrator.ts';
 import { createTaskDirectories, cleanupTaskTemp, killTaskProcesses, ensureDirectories } from '../utils/cleaner.ts';
-import { enforceMax720p, generateThumbnailAt25s, probeMedia } from '../utils/ffmpeg.ts';
+import { enforceMax720p, resolveVideoThumbnail, probeMedia } from '../utils/ffmpeg.ts';
 import { getAvailableDiskSpace } from '../utils/system.ts';
 import { logger } from '../logger.ts';
 
@@ -24,6 +24,7 @@ const MIN_FREE_DISK_BYTES = 250 * 1024 * 1024; // 250 MB minimum free storage
 export class DownloadQueue {
   private activeJobs: Map<string, DownloadTask> = new Map();
   private pendingQueue: QueuedJob[] = [];
+  private completedJobs: DownloadTask[] = [];
   private orchestrator: FallbackOrchestrator;
 
   constructor() {
@@ -101,6 +102,17 @@ export class DownloadQueue {
 
   getPendingQueueLength(): number {
     return this.pendingQueue.length;
+  }
+
+  recordCompletedJob(task: DownloadTask): void {
+    this.completedJobs.unshift({ ...task });
+    if (this.completedJobs.length > 25) {
+      this.completedJobs.pop();
+    }
+  }
+
+  getCompletedJobs(): DownloadTask[] {
+    return [...this.completedJobs];
   }
 
   private async processNext(): Promise<void> {
@@ -191,24 +203,30 @@ export class DownloadQueue {
         task.metadata.fps = finalMeta.fps;
         task.metadata.filesize = finalMeta.sizeBytes;
 
-        // 3. Generate thumbnail at 25th second (or safe fraction) with metadata fallback
+        // 3. Resolve thumbnail according to strict priority:
+        // 1. Thumbnail source
+        // 2. OpenGraph image
+        // 3. Extractor thumbnail
+        // 4. Generate frame from video using FFmpeg (25s or safe fraction)
         task.status = 'generating_thumbnail';
-        onProgress?.('🖼️ Generating thumbnail at 25s...', 95);
+        onProgress?.('🖼️ Resolving thumbnail (Source/OG/Extractor/FFmpeg)...', 95);
 
         const permanentThumbPath = path.join(config.outputDir, `thumb_${task.id}.jpg`);
-        const thumbnailOutput = await generateThumbnailAt25s(
-          permanentVideoPath,
-          permanentThumbPath,
-          finalMeta.duration,
-          task.metadata.thumbnail
-        );
+        const thumbnailOutput = await resolveVideoThumbnail({
+          videoPath: permanentVideoPath,
+          outputPath: permanentThumbPath,
+          duration: finalMeta.duration,
+          sourceThumbnail: task.metadata.sourceThumbnail,
+          ogImage: task.metadata.ogImage,
+          extractorThumbnail: task.metadata.extractorThumbnail || task.metadata.thumbnail,
+        });
 
         if (thumbnailOutput && fs.existsSync(thumbnailOutput)) {
           task.thumbnailPath = thumbnailOutput;
         }
 
-        task.status = 'completed';
-        task.endTime = Date.now();
+        task.status = 'uploading';
+        onProgress?.('📤 Menyiapkan upload wajib ke TARGET_CHANNEL_ID...', 98);
         onComplete(task);
       } else {
         task.status = 'failed';

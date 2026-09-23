@@ -131,7 +131,48 @@ Proyek ini telah dilengkapi dengan patch otomatis untuk mengatasi dua masalah ut
 
 ---
 
-## 🚀 5. Panduan Instalasi & Penggunaan
+## 📢 5. ATURAN PENGIRIMAN VIDEO (Wajib ke TARGET_CHANNEL_ID)
+
+Setiap video yang berhasil didownload **WAJIB** dikirim ke `TARGET_CHANNEL_ID` (dikonfigurasi melalui `.env` atau perintah `.channel`).
+
+### 📌 Diagram Alur Wajib (Strict Flow)
+```
+User mengirim URL
+        ↓
+    Detect URL
+        ↓
+  Analyze source
+        ↓
+  Detect HLS/M3U8
+        ↓
+   Resolve media
+        ↓
+     Download
+        ↓
+  Validate file
+        ↓
+FFmpeg processing (Max 720p, no upscaling)
+        ↓
+  Extract metadata (Judul Bahasa Indonesia)
+        ↓
+Extract/generate thumbnail (Seek 25s)
+        ↓
+Upload ke TARGET_CHANNEL_ID (Retry 3x + FloodWait handler)
+        ↓
+Simpan Telegram message ID
+        ↓
+Kirim status berhasil ke user
+```
+
+### ⚠️ Kebijakan Integritas Download & Upload:
+1. **Upload ke channel BUKAN proses opsional**: Sistem menolak menganggap download selesai jika belum terkirim ke `TARGET_CHANNEL_ID`.
+2. **Downloaded file ≠ Success**: Jika upload ke channel gagal (setelah 3 kali retry atau kendala izin posting), status job secara tegas ditandai **FAILED** (`TELEGRAM_UPLOAD_ERROR`).
+3. **Penyimpanan Message ID**: Setelah pengiriman sukses, Telegram Message ID channel disimpan di dalam task state, dicatat ke history, dan disertakan dalam notifikasi status berhasil yang dikirim ke pengguna.
+4. **Perintah Cepat Channel**: Pengguna dapat memeriksa atau mengubah channel tujuan langsung dari Telegram menggunakan perintah `.channel @namachannel` atau `.channel -100xxxxxxxxxx`.
+
+---
+
+## 🚀 6. Panduan Instalasi & Penggunaan
 
 ### Langkah A: Di Lingkungan Termux (Android)
 ```bash
@@ -154,7 +195,7 @@ bash scripts/setup.sh
 # 2. Cek kesiapan sistem & diagnostik
 pnpm doctor
 
-# 3. Login akun Telegram (CLI Interaktif)
+# 3. Login akun Telegram & Konfigurasi Channel (CLI Interaktif)
 pnpm run login
 ```
 
@@ -174,17 +215,18 @@ pnpm run login
 
 ---
 
-## 💬 6. Perintah Telegram Userbot
+## 💬 7. Perintah Telegram Userbot
 
 Kirim pesan ke **Saved Messages**, obrolan pribadi, atau grup yang diizinkan:
-- `.dl <url>` : Unduh video dari URL/halaman web dengan pipeline multi-layer fallback 6 lapis.
-- `.status` : Tampilkan status antrian download, kapasitas slot, dan uptime.
+- `.dl <url>` : Unduh video dari URL/halaman web dengan pipeline multi-layer fallback 6 lapis & kirim ke target channel.
+- `.channel <id>` : Cek atau ubah `TARGET_CHANNEL_ID` langsung dari obrolan Telegram.
+- `.status` : Tampilkan status antrian aktif, riwayat upload, dan message ID channel.
 - `.ping` : Uji latensi respons userbot ke server Telegram.
 - `.help` : Menampilkan petunjuk penggunaan dan sintaks perintah.
 - *(Opsional)*: Cukup kirim tautan video langsung ke *Saved Messages*, bot akan otomatis mendeteksi dan mengunduhnya.
 
 ---
 
-## 🧪 7. Hasil Pengujian Sistem
-- **Self-Audit Test Suite**: 34/34 Test Suites **PASSED** (0 Failed).
-- Validasi URL parser, direct streams, Playwright interceptor, FFmpeg transcoding, faststart remuxing, thumbnail generator, proteksi debounced progress, dan pipeline fallback handling.
+## 🧪 8. Hasil Pengujian Sistem
+- **Self-Audit Test Suite**: 42/42 Test Suites **PASSED** (0 Failed).
+- Validasi URL parser, direct streams, Playwright interceptor, FFmpeg transcoding, faststart remuxing, thumbnail generator, proteksi debounced progress, verifikasi aturan mandatory upload `TARGET_CHANNEL_ID`, link generator Telegram, dan penegakan *downloaded file ≠ success* saat upload gagal.

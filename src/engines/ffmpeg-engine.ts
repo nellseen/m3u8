@@ -7,6 +7,37 @@ import { getFfmpegPath } from '../utils/system.ts';
 import { validateMediaFile } from '../utils/ffmpeg.ts';
 import { logger } from '../logger.ts';
 
+/**
+ * Builds HTTP headers string for FFmpeg -headers argument
+ * Strictly propagates only genuine source session headers
+ */
+export function buildFfmpegHeaders(headers?: Record<string, string>, cookies?: string): string {
+  if (!headers && !cookies) return '';
+
+  let headerStr = '';
+  const seenKeys = new Set<string>();
+
+  if (headers) {
+    for (const [key, value] of Object.entries(headers)) {
+      if (!value) continue;
+      const lowerKey = key.toLowerCase();
+      if (lowerKey === 'content-length' || lowerKey === 'host') continue; // Managed by network stack
+
+      if (!seenKeys.has(lowerKey)) {
+        seenKeys.add(lowerKey);
+        headerStr += `${key}: ${value}\r\n`;
+      }
+    }
+  }
+
+  // Ensure cookies are included if task has cookies but headers['cookie'] is absent
+  if (cookies && !seenKeys.has('cookie')) {
+    headerStr += `Cookie: ${cookies}\r\n`;
+  }
+
+  return headerStr;
+}
+
 export class FfmpegEngine extends BaseEngine {
   readonly name = 'FFmpeg HLS Direct (Engine 5)';
   readonly priority = 5;
@@ -33,20 +64,13 @@ export class FfmpegEngine extends BaseEngine {
 
     const args: string[] = ['-y'];
 
-    // Add protocol whitelist for HLS/crypto
+    // Add protocol whitelist for HLS/crypto/data
     args.push('-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data');
 
-    if (task.streamHeaders) {
-      let headerStr = '';
-      if (task.streamHeaders['referer']) {
-        headerStr += `Referer: ${task.streamHeaders['referer']}\r\n`;
-      }
-      if (task.streamHeaders['user-agent']) {
-        headerStr += `User-Agent: ${task.streamHeaders['user-agent']}\r\n`;
-      }
-      if (headerStr) {
-        args.push('-headers', headerStr);
-      }
+    // Contextual header propagation (User-Agent, Referer, Origin, Cookie, Authorization, etc.)
+    const headerStr = buildFfmpegHeaders(task.streamHeaders, task.cookies);
+    if (headerStr) {
+      args.push('-headers', headerStr);
     }
 
     args.push(
@@ -107,10 +131,17 @@ export class FfmpegEngine extends BaseEngine {
 
         // If stream copy failed due to incompatible codecs or variant issues, retry with transcoding
         logger.warn('FFmpeg copy failed, retrying with re-encode fallback...');
-        const transcodeProc = spawn(ffmpegBin, [
+        const transcodeArgs = [
           '-y',
           '-protocol_whitelist',
           'file,http,https,tcp,tls,crypto,data',
+        ];
+
+        if (headerStr) {
+          transcodeArgs.push('-headers', headerStr);
+        }
+
+        transcodeArgs.push(
           '-i',
           targetUrl,
           '-c:v',
@@ -121,8 +152,10 @@ export class FfmpegEngine extends BaseEngine {
           'aac',
           '-movflags',
           '+faststart',
-          finalMp4,
-        ]);
+          finalMp4
+        );
+
+        const transcodeProc = spawn(ffmpegBin, transcodeArgs);
 
         if (transcodeProc.pid) {
           task.subprocesses.push(transcodeProc.pid);

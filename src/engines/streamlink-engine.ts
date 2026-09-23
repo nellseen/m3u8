@@ -42,18 +42,43 @@ export class StreamlinkEngine extends BaseEngine {
       '30',
     ];
 
-    // Add custom headers if captured by Playwright
+    // Contextual Header Propagation (Referer, User-Agent, Origin, Authorization, Cookie)
     if (task.streamHeaders) {
-      if (task.streamHeaders['referer']) {
-        args.push('--http-header', `Referer=${task.streamHeaders['referer']}`);
+      const lowerHeaders: Record<string, string> = {};
+      for (const [k, v] of Object.entries(task.streamHeaders)) {
+        lowerHeaders[k.toLowerCase()] = v;
       }
-      if (task.streamHeaders['user-agent']) {
-        args.push('--http-header', `User-Agent=${task.streamHeaders['user-agent']}`);
+
+      if (lowerHeaders['referer']) {
+        args.push('--http-header', `Referer=${lowerHeaders['referer']}`);
+      }
+      if (lowerHeaders['user-agent']) {
+        args.push('--http-header', `User-Agent=${lowerHeaders['user-agent']}`);
+      }
+      if (lowerHeaders['origin']) {
+        args.push('--http-header', `Origin=${lowerHeaders['origin']}`);
+      }
+      if (lowerHeaders['authorization']) {
+        args.push('--http-header', `Authorization=${lowerHeaders['authorization']}`);
+      }
+      if (lowerHeaders['accept']) {
+        args.push('--http-header', `Accept=${lowerHeaders['accept']}`);
+      }
+      if (lowerHeaders['accept-language']) {
+        args.push('--http-header', `Accept-Language=${lowerHeaders['accept-language']}`);
       }
     }
 
+    if (task.cookies) {
+      args.push('--http-header', `Cookie=${task.cookies}`);
+    }
+
     // Prioritize 720p, then lower resolutions, avoiding 1080p/4k unless fallback
-    args.push(targetUrl, '720p,720p60,480p,360p,worst,best');
+    let streamTarget = targetUrl;
+    if (targetUrl.includes('.m3u8') && !targetUrl.startsWith('hlsvariant://') && !targetUrl.startsWith('hls://')) {
+      streamTarget = `hlsvariant://${targetUrl}`;
+    }
+    args.push(streamTarget, '720p,720p60,480p,360p,worst,best');
 
     return new Promise(resolve => {
       let stderr = '';
@@ -86,46 +111,43 @@ export class StreamlinkEngine extends BaseEngine {
 
       proc.on('close', async code => {
         task.abortController.signal.removeEventListener('abort', abortHandler);
-        if (code === 0 && fs.existsSync(rawOutput) && fs.statSync(rawOutput).size > 1000) {
-          onProgress?.('⚙️ Remuxing Streamlink stream with FFmpeg...', 85);
-          try {
-            await remuxToTelegramMp4(rawOutput, finalMp4);
 
+        if (code === 0 && fs.existsSync(rawOutput) && fs.statSync(rawOutput).size > 1000) {
+          onProgress?.('⚙️ Remuxing Streamlink stream to Telegram MP4 format...', 80);
+          await remuxToTelegramMp4(rawOutput, finalMp4);
+
+          // Cleanup raw TS file
+          try { fs.unlinkSync(rawOutput); } catch {}
+
+          if (fs.existsSync(finalMp4)) {
             const validation = await validateMediaFile(finalMp4);
-            if (!validation.valid) {
-              try { fs.unlinkSync(finalMp4); } catch {}
+            if (validation.valid) {
               resolve({
-                success: false,
+                success: true,
+                outputPath: finalMp4,
                 engineName: this.name,
-                error: `Streamlink output failed validation: ${validation.error}`,
-                errorType: 'INVALID_MEDIA',
               });
               return;
             }
-
-            resolve({
-              success: true,
-              outputPath: finalMp4,
-              engineName: this.name,
-            });
-          } catch (err: any) {
-            resolve({
-              success: false,
-              engineName: this.name,
-              error: `Streamlink remux failed: ${err.message}`,
-              errorType: 'FFMPEG_ERROR',
-            });
           }
-        } else {
-          const errMsg = stderr || stdout || `Process exited with code ${code}`;
-          logger.warn(`Streamlink failed: ${errMsg.slice(-250)}`);
-          resolve({
-            success: false,
-            engineName: this.name,
-            error: errMsg.slice(0, 300),
-            errorType: 'EXTRACTOR_UNSUPPORTED',
-          });
         }
+
+        const errMsg = stderr || stdout || `Process exited with code ${code}`;
+        logger.warn(`Streamlink failed: ${errMsg.slice(-250)}`);
+
+        let errorType: any = 'PROCESS_ERROR';
+        if (errMsg.includes('No plugin can handle URL') || errMsg.includes('No playable streams found')) {
+          errorType = 'NO_MEDIA_FOUND';
+        } else if (errMsg.includes('403 Client Error')) {
+          errorType = 'NETWORK_ERROR';
+        }
+
+        resolve({
+          success: false,
+          engineName: this.name,
+          error: errMsg.slice(0, 300),
+          errorType,
+        });
       });
 
       proc.on('error', err => {
@@ -133,7 +155,7 @@ export class StreamlinkEngine extends BaseEngine {
         resolve({
           success: false,
           engineName: this.name,
-          error: `Streamlink spawn error: ${err.message}`,
+          error: `Streamlink execution error: ${err.message}`,
           errorType: 'PROCESS_ERROR',
         });
       });

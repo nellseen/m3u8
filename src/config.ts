@@ -71,6 +71,7 @@ export const config: BotConfig = {
   autoDownloadPrivate: getEnvBool('AUTO_DOWNLOAD_PRIVATE', true),
   autoDownloadGroups: getEnvBool('AUTO_DOWNLOAD_GROUPS', false),
   commandPrefix: getEnvString('COMMAND_PREFIX', '.'),
+  targetChannelId: getEnvString('TARGET_CHANNEL_ID', ''),
   customPaths: {
     ffmpeg: getEnvString('FFMPEG_PATH', ''),
     ytdlp: getEnvString('YTDLP_PATH', ''),
@@ -122,6 +123,8 @@ export function saveEnvConfig(updates: Record<string, string | number>): void {
       } else if (key === 'TELEGRAM_SESSION') {
         config.session = value;
         registerSensitiveValue(config.session);
+      } else if (key === 'TARGET_CHANNEL_ID') {
+        config.targetChannelId = value;
       }
     }
 
@@ -129,6 +132,12 @@ export function saveEnvConfig(updates: Record<string, string | number>): void {
   } catch (err) {
     console.error('Failed to update .env automatically:', err);
   }
+}
+
+export function saveTargetChannel(newChannelId: string): void {
+  const cleanId = newChannelId.trim();
+  config.targetChannelId = cleanId;
+  saveEnvConfig({ TARGET_CHANNEL_ID: cleanId });
 }
 
 export function saveApiCredentials(newApiId: number, newApiHash: string): void {
