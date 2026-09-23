@@ -1,18 +1,1557 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Telegram Video HLS Fallback Userbot</title>
-    <meta name="description" content="Telegram Userbot video downloader with multi-layer HLS/M3U8 fallback orchestrator and FFmpeg processing." />
-    <meta property="og:title" content="Telegram Video HLS Fallback Userbot" />
-    <meta property="og:description" content="Telegram Userbot video downloader with multi-layer HLS/M3U8 fallback orchestrator and FFmpeg processing." />
-    <meta property="og:type" content="website" />
-    <meta name="twitter:card" content="summary_large_image" />
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Telegram Video HLS Fallback Userbot</title>
+  <meta name="description" content="Telegram Userbot video downloader with multi-layer HLS/M3U8 fallback orchestrator and FFmpeg processing." />
+  <meta property="og:title" content="Telegram Video HLS Fallback Userbot" />
+  <meta property="og:description" content="Telegram Userbot video downloader with multi-layer HLS/M3U8 fallback orchestrator and FFmpeg processing." />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary_large_image" />
 
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <style>
+    :root {
+      --bg-base: #080c14;
+      --bg-surface: #0e1524;
+      --bg-surface-elevated: #141d30;
+      --bg-surface-hover: #1a253c;
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-strong: rgba(255, 255, 255, 0.16);
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent-emerald: #10b981;
+      --accent-emerald-soft: rgba(16, 185, 129, 0.12);
+      --accent-cyan: #06b6d4;
+      --accent-cyan-soft: rgba(6, 182, 212, 0.12);
+      --accent-amber: #f59e0b;
+      --accent-amber-soft: rgba(245, 158, 11, 0.12);
+      --accent-rose: #f43f5e;
+      --accent-rose-soft: rgba(244, 63, 94, 0.12);
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 16px;
+      --radius-xl: 20px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      background-color: var(--bg-base);
+      color: var(--text-primary);
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      overflow-x: hidden;
+    }
+
+    .font-mono {
+      font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+    }
+
+    .tabular-nums {
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Container constraints */
+    .container {
+      width: 100%;
+      max-width: 1280px;
+      margin-left: auto;
+      margin-right: auto;
+      padding-left: 1.5rem;
+      padding-right: 1.5rem;
+    }
+
+    /* Header: Strict 3-zone contract */
+    .top-bar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      background-color: rgba(8, 12, 20, 0.85);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .top-bar-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 4rem;
+      gap: 1.5rem;
+    }
+
+    .brand-wordmark {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+      text-decoration: none;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    .brand-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--accent-emerald);
+      box-shadow: 0 0 10px var(--accent-emerald);
+    }
+
+    .nav-links {
+      display: none;
+      align-items: center;
+      gap: 2rem;
+    }
+
+    @media (min-width: 768px) {
+      .nav-links {
+        display: flex;
+      }
+    }
+
+    .nav-link {
+      font-size: 0.875rem;
+      font-weight: 500;
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: color 150ms ease;
+      position: relative;
+      white-space: nowrap;
+    }
+
+    .nav-link:hover {
+      color: var(--text-primary);
+    }
+
+    .nav-link::after {
+      content: '';
+      position: absolute;
+      bottom: -4px;
+      left: 0;
+      width: 0;
+      height: 1.5px;
+      background-color: var(--accent-cyan);
+      transition: width 150ms ease;
+    }
+
+    .nav-link:hover::after {
+      width: 100%;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.875rem;
+      flex-shrink: 0;
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 0.5rem 1.1rem;
+      font-size: 0.875rem;
+      font-weight: 600;
+      border-radius: var(--radius-md);
+      text-decoration: none;
+      white-space: nowrap;
+      cursor: pointer;
+      transition: all 180ms cubic-bezier(0.16, 1, 0.3, 1);
+      border: 1px solid transparent;
+      outline: none;
+    }
+
+    .btn:focus-visible {
+      box-shadow: 0 0 0 2px var(--accent-cyan);
+    }
+
+    .btn-primary {
+      background-color: var(--accent-emerald);
+      color: #042f1a;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 18px rgba(16, 185, 129, 0.25);
+    }
+
+    .btn-primary:hover {
+      background-color: #34d399;
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background-color: var(--bg-surface-elevated);
+      color: var(--text-primary);
+      border-color: var(--border-subtle);
+    }
+
+    .btn-secondary:hover {
+      background-color: var(--bg-surface-hover);
+      border-color: var(--border-strong);
+    }
+
+    /* Hero Section */
+    .hero-section {
+      padding-top: 3.5rem;
+      padding-bottom: 4rem;
+      position: relative;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 3rem;
+      align-items: center;
+    }
+
+    @media (min-width: 1024px) {
+      .hero-grid {
+        grid-template-columns: 1.15fr 0.85fr;
+      }
+    }
+
+    .hero-title {
+      font-size: 2.25rem;
+      line-height: 1.15;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: var(--text-primary);
+      text-wrap: balance;
+    }
+
+    @media (min-width: 768px) {
+      .hero-title {
+        font-size: 3.25rem;
+      }
+    }
+
+    .hero-highlight {
+      background: linear-gradient(135deg, #38bdf8 0%, #10b981 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero-desc {
+      margin-top: 1.25rem;
+      font-size: 1.1rem;
+      line-height: 1.65;
+      color: var(--text-secondary);
+      max-width: 38rem;
+    }
+
+    /* Unboxed metadata separator discipline */
+    .metadata-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.6rem;
+      margin-top: 1.5rem;
+      font-size: 0.825rem;
+      color: var(--text-secondary);
+    }
+
+    .metadata-sep {
+      color: var(--text-muted);
+      opacity: 0.6;
+    }
+
+    .hero-cta-group {
+      margin-top: 2rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      align-items: center;
+    }
+
+    /* Visual asset slot with zero-broken-image policy */
+    .hero-visual-card {
+      position: relative;
+      border-radius: var(--radius-xl);
+      overflow: hidden;
+      border: 1px solid var(--border-subtle);
+      background-color: var(--bg-surface);
+      aspect-ratio: 16 / 9;
+      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.7);
+    }
+
+    .hero-visual-card img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      transition: transform 300ms ease;
+    }
+
+    .hero-visual-overlay {
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(8, 12, 20, 0.1) 0%, rgba(8, 12, 20, 0.85) 100%);
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      padding: 1.5rem;
+    }
+
+    .hero-visual-fallback {
+      display: none;
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, #0e1524 0%, #172554 100%);
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-secondary);
+      text-align: center;
+      padding: 1.5rem;
+    }
+
+    /* Live Telemetry Banner */
+    .telemetry-row {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1rem;
+      margin-top: 2.5rem;
+    }
+
+    @media (min-width: 768px) {
+      .telemetry-row {
+        grid-template-columns: repeat(4, 1fr);
+      }
+    }
+
+    .telemetry-item {
+      background-color: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 1.25rem;
+    }
+
+    .telemetry-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+
+    .telemetry-value {
+      margin-top: 0.5rem;
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .telemetry-foot {
+      margin-top: 0.35rem;
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+    }
+
+    /* Section Headers */
+    .section-wrap {
+      padding-top: 5rem;
+      padding-bottom: 2rem;
+    }
+
+    .section-header {
+      margin-bottom: 2.5rem;
+    }
+
+    .section-kicker {
+      font-size: 0.825rem;
+      font-weight: 600;
+      color: var(--accent-cyan);
+      letter-spacing: 0.04em;
+      margin-bottom: 0.5rem;
+    }
+
+    .section-title {
+      font-size: 1.85rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+      text-wrap: balance;
+    }
+
+    .section-desc {
+      margin-top: 0.5rem;
+      font-size: 1rem;
+      color: var(--text-secondary);
+      max-width: 42rem;
+    }
+
+    /* Bento Grid: 6-Engine Cascading Architecture */
+    .bento-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1.25rem;
+    }
+
+    @media (min-width: 768px) {
+      .bento-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (min-width: 1024px) {
+      .bento-grid {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
+
+    .bento-card {
+      background-color: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: border-color 150ms ease, transform 150ms ease;
+    }
+
+    .bento-card:hover {
+      border-color: var(--border-strong);
+      transform: translateY(-2px);
+    }
+
+    .bento-card.marquee {
+      grid-column: span 1;
+    }
+
+    @media (min-width: 1024px) {
+      .bento-card.marquee {
+        grid-column: span 2;
+      }
+    }
+
+    .engine-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .engine-number {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--accent-cyan);
+    }
+
+    .engine-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-top: 0.25rem;
+    }
+
+    .engine-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.25rem 0.6rem;
+      border-radius: var(--radius-sm);
+      white-space: nowrap;
+    }
+
+    .badge-ready {
+      background-color: var(--accent-emerald-soft);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+
+    .badge-warning {
+      background-color: var(--accent-amber-soft);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.25);
+    }
+
+    .engine-desc {
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+
+    .engine-specs {
+      margin-top: 1.25rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border-subtle);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+
+    /* Live Queue & Simulator Section */
+    .dual-panel {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1.5rem;
+    }
+
+    @media (min-width: 1024px) {
+      .dual-panel {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    .panel-box {
+      background-color: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 1.75rem;
+    }
+
+    .panel-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-bottom: 0.35rem;
+    }
+
+    .panel-sub {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      margin-bottom: 1.5rem;
+    }
+
+    /* Interactive URL Simulator */
+    .input-row {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    @media (min-width: 640px) {
+      .input-row {
+        flex-direction: row;
+      }
+    }
+
+    .url-input {
+      flex: 1;
+      background-color: var(--bg-base);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-md);
+      padding: 0.65rem 0.9rem;
+      color: var(--text-primary);
+      font-size: 0.875rem;
+      outline: none;
+      transition: border-color 150ms ease;
+    }
+
+    .url-input:focus {
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.2);
+    }
+
+    .sample-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+    }
+
+    .sample-btn {
+      background-color: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 0.25rem 0.6rem;
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 120ms ease;
+    }
+
+    .sample-btn:hover {
+      background-color: var(--bg-surface-hover);
+      color: var(--text-primary);
+      border-color: var(--border-strong);
+    }
+
+    .sim-result-box {
+      margin-top: 1.25rem;
+      border-radius: var(--radius-md);
+      background-color: var(--bg-base);
+      border: 1px solid var(--border-subtle);
+      padding: 1rem;
+      font-size: 0.85rem;
+    }
+
+    .sim-step {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.35rem 0;
+      color: var(--text-secondary);
+    }
+
+    .sim-step-active {
+      color: var(--accent-emerald);
+      font-weight: 600;
+    }
+
+    /* Queue Table */
+    .queue-table-wrap {
+      overflow-x: auto;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .queue-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.85rem;
+    }
+
+    .queue-table th {
+      background-color: var(--bg-surface-elevated);
+      color: var(--text-muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.725rem;
+      letter-spacing: 0.05em;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .queue-table td {
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+    }
+
+    .queue-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .queue-empty-state {
+      padding: 2.5rem 1.5rem;
+      text-align: center;
+      color: var(--text-muted);
+    }
+
+    /* Commands Grid */
+    .cmd-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1rem;
+    }
+
+    @media (min-width: 640px) {
+      .cmd-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (min-width: 1024px) {
+      .cmd-grid {
+        grid-template-columns: repeat(4, 1fr);
+      }
+    }
+
+    .cmd-card {
+      background-color: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 1.25rem;
+      cursor: pointer;
+      position: relative;
+      transition: all 150ms ease;
+    }
+
+    .cmd-card:hover {
+      border-color: var(--accent-cyan);
+      transform: translateY(-2px);
+    }
+
+    .cmd-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.5rem;
+    }
+
+    .cmd-code {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #38bdf8;
+    }
+
+    .cmd-copy-hint {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      opacity: 0.8;
+    }
+
+    .cmd-desc {
+      font-size: 0.825rem;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    /* System Hardening Bento */
+    .specs-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1.25rem;
+    }
+
+    @media (min-width: 768px) {
+      .specs-grid {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
+
+    .spec-item {
+      background-color: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+    }
+
+    .spec-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-bottom: 0.4rem;
+    }
+
+    .spec-body {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+
+    /* Operator Terminal Box */
+    .terminal-box {
+      background-color: #05080e;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-xl);
+      padding: 1.75rem;
+      margin-top: 3rem;
+    }
+
+    .terminal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border-subtle);
+      margin-bottom: 1.25rem;
+    }
+
+    .terminal-dots {
+      display: flex;
+      gap: 6px;
+    }
+
+    .terminal-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+
+    .terminal-line {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      padding: 0.5rem 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+      font-size: 0.85rem;
+    }
+
+    .terminal-cmd {
+      color: #38bdf8;
+      cursor: pointer;
+    }
+
+    .terminal-cmd:hover {
+      text-decoration: underline;
+    }
+
+    .terminal-note {
+      color: var(--text-muted);
+      font-size: 0.775rem;
+    }
+
+    /* Footer: Quiet Contract */
+    .site-footer {
+      border-top: 1px solid var(--border-subtle);
+      padding-top: 3rem;
+      padding-bottom: 3.5rem;
+      margin-top: 5rem;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+    }
+
+    .footer-inner {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    @media (min-width: 768px) {
+      .footer-inner {
+        flex-direction: row;
+      }
+    }
+
+    .footer-links {
+      display: flex;
+      gap: 1.5rem;
+    }
+
+    .footer-link {
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: color 120ms ease;
+    }
+
+    .footer-link:hover {
+      color: var(--text-primary);
+    }
+
+    /* Toast Notification */
+    .toast {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      background-color: var(--bg-surface-elevated);
+      color: var(--text-primary);
+      border: 1px solid var(--border-strong);
+      padding: 0.6rem 1.1rem;
+      border-radius: var(--radius-md);
+      font-size: 0.825rem;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+      opacity: 0;
+      transform: translateY(10px);
+      pointer-events: none;
+      transition: all 200ms cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 100;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Bar: Strict 3-Zone Contract -->
+  <header class="top-bar">
+    <div class="container top-bar-inner">
+      <!-- Zone 1: Single text element wordmark -->
+      <a href="/" class="brand-wordmark">
+        <span class="brand-dot" id="headerStatusDot"></span>
+        <span>TeleStream Engine</span>
+      </a>
+
+      <!-- Zone 2: 4-6 Clean navigation text links with hover underline -->
+      <nav class="nav-links">
+        <a href="#overview" class="nav-link">Overview</a>
+        <a href="#engines" class="nav-link">Engines</a>
+        <a href="#simulator" class="nav-link">URL Simulator</a>
+        <a href="#queue" class="nav-link">Live Queue</a>
+        <a href="#commands" class="nav-link">Commands</a>
+        <a href="#terminal" class="nav-link">Terminal</a>
+      </nav>
+
+      <!-- Zone 3: 1-2 Primary Actions -->
+      <div class="header-actions">
+        <button id="refreshBtn" class="btn btn-secondary" onclick="fetchLiveStatus(true)" title="Poll latest system telemetry">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+          <span class="tabular-nums" id="pollTimer">Live (3s)</span>
+        </button>
+        <a href="#simulator" class="btn btn-primary">
+          Test Stream
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Hero Section -->
+    <section id="overview" class="hero-section">
+      <div class="container hero-grid">
+        <div>
+          <h1 class="hero-title">
+            Industrial-Grade Telegram Video <span class="hero-highlight">HLS Fallback</span> Engine
+          </h1>
+          <p class="hero-desc">
+            A resilient 6-layer streaming pipeline designed to intercept, reassemble, and deliver protected HLS/M3U8 media straight to Telegram with automatic 720p transcoding and zero process leakage.
+          </p>
+
+          <!-- Zero-pill metadata discipline: unboxed text with subtle separators -->
+          <div class="metadata-strip">
+            <span id="metaUserbotStatus">Userbot: Initializing</span>
+            <span class="metadata-sep" aria-hidden="true">·</span>
+            <span id="metaArch">Architecture: Linux x64</span>
+            <span class="metadata-sep" aria-hidden="true">·</span>
+            <span>Policy: Max 720p Remux</span>
+            <span class="metadata-sep" aria-hidden="true">·</span>
+            <span id="metaUptime">Uptime: 0s</span>
+          </div>
+
+          <div class="hero-cta-group">
+            <a href="#simulator" class="btn btn-primary">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Interactive URL Tester
+            </a>
+            <a href="#commands" class="btn btn-secondary">
+              Telegram Commands
+            </a>
+          </div>
+        </div>
+
+        <!-- Promotional Visual Showcase -->
+        <div class="hero-visual-card">
+          <img
+            src="/assets/images/hero_stream_engine_1790130012941.jpg"
+            alt="TeleStream Fallback Engine Core Architecture"
+            referrerpolicy="no-referrer"
+            onerror="this.style.display='none'; document.getElementById('heroFallback').style.display='flex';"
+          />
+          <div id="heroFallback" class="hero-visual-fallback">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+            <p style="margin-top: 0.75rem; font-weight: 600; color: #f8fafc;">TeleStream Fallback Engine</p>
+            <p style="font-size: 0.8rem; color: #94a3b8;">Multi-Layer Streaming Media Transcoder</p>
+          </div>
+          <div class="hero-visual-overlay">
+            <div style="font-size: 0.75rem; font-weight: 600; color: var(--accent-cyan); text-transform: uppercase; letter-spacing: 0.05em;">Orchestrator Pipeline</div>
+            <div style="font-size: 1.1rem; font-weight: 700; color: #ffffff; margin-top: 0.2rem;">Cascading Fallback Failover</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Telemetry Matrix -->
+      <div class="container">
+        <div class="telemetry-row">
+          <div class="telemetry-item">
+            <div class="telemetry-label">Active Worker Slots</div>
+            <div class="telemetry-value tabular-nums font-mono" id="statConcurrency">0 / 2</div>
+            <div class="telemetry-foot" id="statConcurrencyFoot">Max concurrency bound</div>
+          </div>
+          <div class="telemetry-item">
+            <div class="telemetry-label">Pending In Queue</div>
+            <div class="telemetry-value tabular-nums font-mono" id="statPending">0</div>
+            <div class="telemetry-foot">Awaiting execution</div>
+          </div>
+          <div class="telemetry-item">
+            <div class="telemetry-label">Available Engines</div>
+            <div class="telemetry-value tabular-nums font-mono" id="statEngines">6 / 6</div>
+            <div class="telemetry-foot">Registered fallbacks</div>
+          </div>
+          <div class="telemetry-item">
+            <div class="telemetry-label">System Health</div>
+            <div class="telemetry-value font-mono" id="statHealth" style="color: var(--accent-emerald);">HEALTHY</div>
+            <div class="telemetry-foot" id="statHealthFoot">Dev server listening</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Bento Grid: 6-Engine Cascading Architecture -->
+    <section id="engines" class="section-wrap">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-kicker">Core Pipeline</div>
+          <h2 class="section-title">Cascading 6-Engine Fallback Pipeline</h2>
+          <p class="section-desc">
+            When a video stream URL arrives, the orchestrator cascades through 6 specialized extraction layers. If one engine encounters anti-bot shielding or unsupported protocols, failover to the next engine occurs in milliseconds.
+          </p>
+        </div>
+
+        <div class="bento-grid">
+          <!-- Engine 1 -->
+          <div class="bento-card">
+            <div>
+              <div class="engine-head">
+                <div>
+                  <div class="engine-number font-mono">ENGINE 01</div>
+                  <div class="engine-title">Direct / HLS Detection</div>
+                </div>
+                <span class="engine-badge badge-ready font-mono" id="badge-engine-1">READY</span>
+              </div>
+              <p class="engine-desc">
+                High-speed parser for direct <code>.m3u8</code> and <code>.mp4</code> URLs. Performs zero-latency HTTP probe and immediate routing without launching heavyweight browser overhead.
+              </p>
+            </div>
+            <div class="engine-specs font-mono">
+              <span>Latency: &lt;50ms</span>
+              <span>·</span>
+              <span>Fast Path</span>
+            </div>
+          </div>
+
+          <!-- Engine 2 -->
+          <div class="bento-card marquee">
+            <div>
+              <div class="engine-head">
+                <div>
+                  <div class="engine-number font-mono">ENGINE 02 · DEEP INSPECTOR</div>
+                  <div class="engine-title">Playwright + Chromium Network Sniffer</div>
+                </div>
+                <span class="engine-badge badge-ready font-mono" id="badge-engine-2">READY</span>
+              </div>
+              <p class="engine-desc">
+                Full headless browser automation tuned for PRoot & Linux ARM64/x64. Intercepts asynchronous XHR/fetch requests, decrypts dynamic manifest URLs, and extracts hidden video tags directly from the DOM before rendering completes.
+              </p>
+            </div>
+            <div class="engine-specs font-mono">
+              <span>PRoot-Safe Sandbox</span>
+              <span>·</span>
+              <span>Headless DOM Listener</span>
+              <span>·</span>
+              <span>Network Interception</span>
+            </div>
+          </div>
+
+          <!-- Engine 3 -->
+          <div class="bento-card">
+            <div>
+              <div class="engine-head">
+                <div>
+                  <div class="engine-number font-mono">ENGINE 03</div>
+                  <div class="engine-title">Streamlink Processor</div>
+                </div>
+                <span class="engine-badge badge-ready font-mono" id="badge-engine-3">READY</span>
+              </div>
+              <p class="engine-desc">
+                Dedicated livestreaming engine optimized for live broadcast feeds, Twitch, Vimeo, and custom RTMP/HLS transport streams. Pipe segments directly with minimal buffer overhead.
+              </p>
+            </div>
+            <div class="engine-specs font-mono">
+              <span>Livestream Optimized</span>
+              <span>·</span>
+              <span>RTMP / HLS Streams</span>
+            </div>
+          </div>
+
+          <!-- Engine 4 -->
+          <div class="bento-card">
+            <div>
+              <div class="engine-head">
+                <div>
+                  <div class="engine-number font-mono">ENGINE 04</div>
+                  <div class="engine-title">yt-dlp Universal Extractor</div>
+                </div>
+                <span class="engine-badge badge-ready font-mono" id="badge-engine-4">READY</span>
+              </div>
+              <p class="engine-desc">
+                Comprehensive fallback covering 1,000+ media sites. Enforces automatic bestvideo+bestaudio merging capped at 720p to preserve bandwidth and conform to mobile Telegram playback.
+              </p>
+            </div>
+            <div class="engine-specs font-mono">
+              <span>1000+ Portals</span>
+              <span>·</span>
+              <span>Format Fallback</span>
+            </div>
+          </div>
+
+          <!-- Engine 5 -->
+          <div class="bento-card">
+            <div>
+              <div class="engine-head">
+                <div>
+                  <div class="engine-number font-mono">ENGINE 05</div>
+                  <div class="engine-title">FFmpeg HLS Direct Remux</div>
+                </div>
+                <span class="engine-badge badge-ready font-mono" id="badge-engine-5">READY</span>
+              </div>
+              <p class="engine-desc">
+                Native FFmpeg TS reassembly engine. Downloads individual transport stream (.ts) chunks, re-aligns Presentation Time Stamps (PTS), and outputs faststart MP4 containers.
+              </p>
+            </div>
+            <div class="engine-specs font-mono">
+              <span>PTS Alignment</span>
+              <span>·</span>
+              <span>Lossless Remux</span>
+            </div>
+          </div>
+
+          <!-- Engine 6 -->
+          <div class="bento-card">
+            <div>
+              <div class="engine-head">
+                <div>
+                  <div class="engine-number font-mono">ENGINE 06</div>
+                  <div class="engine-title">Secondary Stream Retry</div>
+                </div>
+                <span class="engine-badge badge-ready font-mono" id="badge-engine-6">READY</span>
+              </div>
+              <p class="engine-desc">
+                Heuristic failover analyzing previously collected video candidates during the browser or network phase, re-attempting alternative bitrates if the master playlist drops connection.
+              </p>
+            </div>
+            <div class="engine-specs font-mono">
+              <span>Heuristic Fallback</span>
+              <span>·</span>
+              <span>Final Guard</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Interactive URL Simulator & Live Queue -->
+    <section id="simulator" class="section-wrap">
+      <div class="container dual-panel">
+        <!-- Panel 1: URL Inspector / Simulator -->
+        <div class="panel-box">
+          <div class="panel-title">Interactive Stream URL Inspector</div>
+          <div class="panel-sub">Simulate how the 6-layer pipeline classifies and routes any video or HLS manifest link.</div>
+
+          <div class="input-row">
+            <input
+              type="text"
+              id="testUrlInput"
+              class="url-input font-mono"
+              placeholder="https://example.com/playlist.m3u8 or video webpage"
+              value="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+            />
+            <button class="btn btn-primary" onclick="simulateUrlRoute()">
+              Inspect Route
+            </button>
+          </div>
+
+          <div class="sample-tags">
+            <span style="font-size: 0.75rem; color: var(--text-muted); align-self: center;">Presets:</span>
+            <button class="sample-btn font-mono" onclick="setPresetUrl('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8')">HLS M3U8</button>
+            <button class="sample-btn font-mono" onclick="setPresetUrl('https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4')">Direct MP4</button>
+            <button class="sample-btn font-mono" onclick="setPresetUrl('https://vimeo.com/76979871')">Web Portal</button>
+          </div>
+
+          <div class="sim-result-box" id="simResultBox">
+            <div style="font-weight: 600; color: var(--text-primary); margin-bottom: 0.5rem;" id="simSummary">
+              Ready to inspect. Click "Inspect Route" to simulate pipeline triage.
+            </div>
+            <div id="simPipelineSteps">
+              <div class="sim-step"><span class="font-mono">1.</span> Direct URL regex & manifest check</div>
+              <div class="sim-step"><span class="font-mono">2.</span> Engine availability verification</div>
+              <div class="sim-step"><span class="font-mono">3.</span> Transcoding resolution ceiling (720p)</div>
+              <div class="sim-step"><span class="font-mono">4.</span> Isolated directory scratch setup</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Panel 2: Live Download Queue -->
+        <div class="panel-box" id="queue">
+          <div style="display: flex; align-items: center; justify-content: space-between;">
+            <div>
+              <div class="panel-title">Live Queue & Active Jobs</div>
+              <div class="panel-sub">Real-time status of downloads running through the orchestrator.</div>
+            </div>
+            <span class="engine-badge badge-ready font-mono" id="queueBadge">0 IN FLIGHT</span>
+          </div>
+
+          <div class="queue-table-wrap">
+            <table class="queue-table">
+              <thead>
+                <tr>
+                  <th>Job ID</th>
+                  <th>Source URL</th>
+                  <th>Engine</th>
+                  <th>Elapsed</th>
+                </tr>
+              </thead>
+              <tbody id="queueTableBody">
+                <tr>
+                  <td colspan="4" class="queue-empty-state">
+                    No active downloads in flight. Queue is clear and listening for Telegram commands.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div style="margin-top: 1.25rem; font-size: 0.8rem; color: var(--text-muted); display: flex; justify-content: space-between;">
+            <span>Worker limit: <strong id="limitWorkers" style="color: var(--text-secondary);">2 concurrent</strong></span>
+            <span>Isolation: <strong style="color: var(--text-secondary);">Sandboxed Scratch Disks</strong></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Telegram Userbot Command Showcase -->
+    <section id="commands" class="section-wrap">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-kicker">Userbot Command Center</div>
+          <h2 class="section-title">Send Commands from Any Telegram Chat</h2>
+          <p class="section-desc">
+            Use your personal Telegram account to invoke downloading directly in "Saved Messages" or authorized chats. Click any card to copy the command syntax.
+          </p>
+        </div>
+
+        <div class="cmd-grid">
+          <div class="cmd-card" onclick="copyCommand('.dl <url>')">
+            <div class="cmd-header">
+              <span class="cmd-code font-mono">.dl &lt;url&gt;</span>
+              <span class="cmd-copy-hint">Click to copy</span>
+            </div>
+            <p class="cmd-desc">
+              Primary download trigger. Analyzes the URL, executes the 6-layer fallback, remuxes to 720p, and uploads the video file directly into the chat.
+            </p>
+          </div>
+
+          <div class="cmd-card" onclick="copyCommand('.status')">
+            <div class="cmd-header">
+              <span class="cmd-code font-mono">.status</span>
+              <span class="cmd-copy-hint">Click to copy</span>
+            </div>
+            <p class="cmd-desc">
+              Returns real-time worker capacity, current active job progress, elapsed seconds, and pending queue count.
+            </p>
+          </div>
+
+          <div class="cmd-card" onclick="copyCommand('.ping')">
+            <div class="cmd-header">
+              <span class="cmd-code font-mono">.ping</span>
+              <span class="cmd-copy-hint">Click to copy</span>
+            </div>
+            <p class="cmd-desc">
+              Calculates round-trip message dispatch latency, confirms Telegram MTProto session health, and responds with millisecond accuracy.
+            </p>
+          </div>
+
+          <div class="cmd-card" onclick="copyCommand('.help')">
+            <div class="cmd-header">
+              <span class="cmd-code font-mono">.help</span>
+              <span class="cmd-copy-hint">Click to copy</span>
+            </div>
+            <p class="cmd-desc">
+              Lists all available userbot directives, engine override flags, and status options with examples.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Hardening & Architecture Specifications -->
+    <section class="section-wrap">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-kicker">Reliability & Bounds</div>
+          <h2 class="section-title">Production-Hardened System Architecture</h2>
+          <p class="section-desc">
+            Built from first principles for resource-constrained environments including Termux on Android, low-cost VPS instances, and containerized Docker clusters.
+          </p>
+        </div>
+
+        <div class="specs-grid">
+          <div class="spec-item">
+            <div class="spec-title">Strict Max 720p Policy</div>
+            <p class="spec-body">
+              Videos with resolution &gt;720p (such as 1080p or 4K) are automatically scaled down to 720p preserving the native aspect ratio. Native videos $\le$ 720p are never upscaled, avoiding artifacting and unnecessary CPU burn.
+            </p>
+          </div>
+
+          <div class="spec-item">
+            <div class="spec-title">Per-Task Scratch Isolation</div>
+            <p class="spec-body">
+              Every download creates an isolated sandbox directory (<code>source</code>, <code>download</code>, <code>processed</code>, <code>thumbnail</code>, <code>logs</code>). Regardless of whether an engine succeeds or fails, temporary files are guaranteed purged on task exit.
+            </p>
+          </div>
+
+          <div class="spec-item">
+            <div class="spec-title">Process Tree SIGKILL Cleanup</div>
+            <p class="spec-body">
+              Subprocesses (Chromium, FFmpeg, yt-dlp, Streamlink) are tracked with dedicated <code>AbortController</code> instances. On timeout or cancellation, parent and child PID trees receive immediate termination to prevent zombie memory leaks.
+            </p>
+          </div>
+        </div>
+
+        <!-- Terminal Quick Action Guide -->
+        <div id="terminal" class="terminal-box">
+          <div class="terminal-header">
+            <div class="terminal-dots">
+              <span class="terminal-dot" style="background-color: #ef4444;"></span>
+              <span class="terminal-dot" style="background-color: #f59e0b;"></span>
+              <span class="terminal-dot" style="background-color: #10b981;"></span>
+            </div>
+            <span style="font-size: 0.775rem; color: var(--text-muted); font-family: monospace;">OPERATOR TERMINAL DIRECTIVES</span>
+          </div>
+
+          <div class="terminal-line">
+            <div>
+              <span style="color: var(--text-muted);">$</span>
+              <span class="terminal-cmd font-mono" onclick="copyCommand('pnpm run login')">pnpm run login</span>
+            </div>
+            <span class="terminal-note">Authenticate Telegram account & generate session string</span>
+          </div>
+
+          <div class="terminal-line">
+            <div>
+              <span style="color: var(--text-muted);">$</span>
+              <span class="terminal-cmd font-mono" onclick="copyCommand('pnpm run doctor')">pnpm run doctor</span>
+            </div>
+            <span class="terminal-note">Diagnose Playwright, Chromium, FFmpeg, yt-dlp, and Streamlink</span>
+          </div>
+
+          <div class="terminal-line">
+            <div>
+              <span style="color: var(--text-muted);">$</span>
+              <span class="terminal-cmd font-mono" onclick="copyCommand('pnpm test')">pnpm test</span>
+            </div>
+            <span class="terminal-note">Run 34-stage self-audit suite (resolutions, fallback recovery, HLS remux)</span>
+          </div>
+
+          <div class="terminal-line">
+            <div>
+              <span style="color: var(--text-muted);">$</span>
+              <span class="terminal-cmd font-mono" onclick="copyCommand('pnpm dev')">pnpm dev</span>
+            </div>
+            <span class="terminal-note">Launch Express telemetry server & Telegram Userbot event loop</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Quiet Editorial Footer -->
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div>
+        <div style="font-weight: 700; color: var(--text-primary);">TeleStream Fallback Engine</div>
+        <div style="margin-top: 0.25rem;">Multi-layer streaming media orchestrator for Telegram Userbots.</div>
+      </div>
+      <div class="footer-links">
+        <a href="/health" target="_blank" class="footer-link font-mono">/health</a>
+        <a href="/status" target="_blank" class="footer-link font-mono">/status</a>
+        <a href="#simulator" class="footer-link">Simulator</a>
+        <a href="#overview" class="footer-link">Back to Top ↑</a>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Toast Element -->
+  <div id="toast" class="toast font-mono">Command copied to clipboard</div>
+
+  <script>
+    let pollInterval = null;
+    let pollCountdown = 3;
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.classList.add('show');
+      setTimeout(() => {
+        toast.classList.remove('show');
+      }, 2000);
+    }
+
+    function copyCommand(text) {
+      navigator.clipboard.writeText(text).then(() => {
+        showToast('Copied: ' + text);
+      }).catch(() => {
+        showToast('Copied to clipboard');
+      });
+    }
+
+    function setPresetUrl(url) {
+      document.getElementById('testUrlInput').value = url;
+      simulateUrlRoute();
+    }
+
+    function simulateUrlRoute() {
+      const input = document.getElementById('testUrlInput').value.trim();
+      const summary = document.getElementById('simSummary');
+      const steps = document.getElementById('simPipelineSteps');
+
+      if (!input) {
+        summary.innerHTML = '<span style="color: var(--accent-rose);">Please enter a valid stream or video URL.</span>';
+        return;
+      }
+
+      const lower = input.toLowerCase();
+      const isM3u8 = lower.includes('.m3u8');
+      const isDirectMp4 = lower.includes('.mp4') || lower.includes('.mkv') || lower.includes('.webm');
+
+      if (isM3u8) {
+        summary.innerHTML = '<span style="color: var(--accent-emerald);">Direct HLS Manifest Detected</span>';
+        steps.innerHTML = `
+          <div class="sim-step sim-step-active"><span class="font-mono">✓</span> <strong>Fast-Path:</strong> Direct M3U8 detected (.m3u8 extension).</div>
+          <div class="sim-step sim-step-active"><span class="font-mono">→</span> <strong>Primary Engine:</strong> Direct / HLS Detection transfers to FFmpeg HLS Remux.</div>
+          <div class="sim-step"><span class="font-mono">3.</span> FFmpeg downloads individual .ts chunks with timestamp re-alignment.</div>
+          <div class="sim-step"><span class="font-mono">4.</span> Max 720p transcoding filter applied if stream height exceeds 720p.</div>
+          <div class="sim-step"><span class="font-mono">5.</span> Faststart MP4 remuxed & dispatched to Telegram chat.</div>
+        `;
+      } else if (isDirectMp4) {
+        summary.innerHTML = '<span style="color: var(--accent-cyan);">Direct Media Container Detected</span>';
+        steps.innerHTML = `
+          <div class="sim-step sim-step-active"><span class="font-mono">✓</span> <strong>Direct Video:</strong> MP4/MKV container found.</div>
+          <div class="sim-step sim-step-active"><span class="font-mono">→</span> <strong>Primary Engine:</strong> Direct HTTP Stream download with resume support.</div>
+          <div class="sim-step"><span class="font-mono">3.</span> FFprobe inspects video metadata (dimensions, codec, audio channel).</div>
+          <div class="sim-step"><span class="font-mono">4.</span> Native resolution preserved if &le; 720p; downscaled if &gt; 720p.</div>
+        `;
+      } else {
+        summary.innerHTML = '<span style="color: var(--accent-amber);">Webpage / Dynamic Stream Detected</span>';
+        steps.innerHTML = `
+          <div class="sim-step sim-step-active"><span class="font-mono">1.</span> Direct regex yields generic webpage URL.</div>
+          <div class="sim-step sim-step-active"><span class="font-mono">→</span> <strong>Engine 2 (Playwright):</strong> Headless Chromium sniffs network requests for hidden M3U8 manifests.</div>
+          <div class="sim-step"><span class="font-mono">3.</span> <strong>Engine 3 (Streamlink):</strong> Activated if livestream or broadcast platform is detected.</div>
+          <div class="sim-step"><span class="font-mono">4.</span> <strong>Engine 4 (yt-dlp):</strong> Universal extractor fallback for 1,000+ supported domains.</div>
+          <div class="sim-step"><span class="font-mono">5.</span> Remuxed to Telegram MP4 with Indonesian title metadata.</div>
+        `;
+      }
+    }
+
+    async function fetchLiveStatus(manual = false) {
+      if (manual) {
+        const btn = document.getElementById('refreshBtn');
+        btn.style.opacity = '0.5';
+        setTimeout(() => { btn.style.opacity = '1'; }, 400);
+      }
+
+      try {
+        const [statusRes, healthRes] = await Promise.all([
+          fetch('/status').then(r => r.json()).catch(() => null),
+          fetch('/health').then(r => r.json()).catch(() => null)
+        ]);
+
+        if (healthRes && healthRes.status === 'healthy') {
+          document.getElementById('statHealth').textContent = 'HEALTHY';
+          document.getElementById('statHealth').style.color = 'var(--accent-emerald)';
+          document.getElementById('headerStatusDot').style.backgroundColor = 'var(--accent-emerald)';
+          document.getElementById('headerStatusDot').style.boxShadow = '0 0 10px var(--accent-emerald)';
+          
+          if (healthRes.uptimeSeconds !== undefined) {
+            const up = healthRes.uptimeSeconds;
+            const h = Math.floor(up / 3600);
+            const m = Math.floor((up % 3600) / 60);
+            const s = up % 60;
+            const upText = h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+            document.getElementById('metaUptime').textContent = 'Uptime: ' + upText;
+          }
+        } else {
+          document.getElementById('statHealth').textContent = 'OFFLINE';
+          document.getElementById('statHealth').style.color = 'var(--accent-rose)';
+        }
+
+        if (statusRes) {
+          // Concurrency & Queue
+          const maxC = statusRes.concurrency?.maxConcurrent ?? 2;
+          const actC = statusRes.concurrency?.activeJobsCount ?? 0;
+          const pend = statusRes.concurrency?.pendingQueueCount ?? 0;
+
+          document.getElementById('statConcurrency').textContent = `${actC} / ${maxC}`;
+          document.getElementById('statPending').textContent = `${pend}`;
+          document.getElementById('limitWorkers').textContent = `${maxC} concurrent`;
+
+          const qBadge = document.getElementById('queueBadge');
+          if (actC > 0) {
+            qBadge.textContent = `${actC} ACTIVE`;
+            qBadge.className = 'engine-badge badge-warning font-mono';
+          } else {
+            qBadge.textContent = '0 IN FLIGHT';
+            qBadge.className = 'engine-badge badge-ready font-mono';
+          }
+
+          // Userbot status
+          const ub = statusRes.telegramUserbot;
+          const metaUb = document.getElementById('metaUserbotStatus');
+          if (ub) {
+            if (ub.authenticated && ub.user) {
+              metaUb.textContent = `Userbot: Connected (@${ub.user.username || ub.user.firstName || ub.user.id})`;
+            } else if (ub.configured) {
+              metaUb.textContent = 'Userbot: Session Required (run: pnpm run login)';
+            } else {
+              metaUb.textContent = 'Userbot: Missing Credentials in .env';
+            }
+          }
+
+          // Active Jobs Table
+          const tbody = document.getElementById('queueTableBody');
+          const jobs = statusRes.activeJobs || [];
+          if (jobs.length === 0) {
+            tbody.innerHTML = `
+              <tr>
+                <td colspan="4" class="queue-empty-state">
+                  No active downloads in flight. Queue is clear and listening for Telegram commands.
+                </td>
+              </tr>
+            `;
+          } else {
+            tbody.innerHTML = jobs.map(j => `
+              <tr>
+                <td class="font-mono" style="color: var(--accent-cyan);">${j.id}</td>
+                <td style="max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${j.url}</td>
+                <td><span class="engine-badge badge-ready font-mono">${j.activeEngine || 'Routing...'}</span></td>
+                <td class="font-mono tabular-nums">${j.elapsedSeconds || 0}s</td>
+              </tr>
+            `).join('');
+          }
+        }
+      } catch (err) {
+        console.warn('Telemetry poll error:', err);
+      }
+    }
+
+    // Try fetching engine availability
+    async function fetchEngineStatuses() {
+      try {
+        const res = await fetch('/api/engines');
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.engines)) {
+            data.engines.forEach((eng, idx) => {
+              const badge = document.getElementById(`badge-engine-${idx + 1}`);
+              if (badge) {
+                if (eng.available) {
+                  badge.textContent = 'READY';
+                  badge.className = 'engine-badge badge-ready font-mono';
+                } else {
+                  badge.textContent = 'STANDBY';
+                  badge.className = 'engine-badge badge-warning font-mono';
+                }
+              }
+            });
+            const readyCount = data.engines.filter(e => e.available).length;
+            document.getElementById('statEngines').textContent = `${readyCount} / ${data.engines.length}`;
+          }
+        }
+      } catch {}
+    }
+
+    // Initialize
+    window.addEventListener('DOMContentLoaded', () => {
+      fetchLiveStatus();
+      fetchEngineStatuses();
+      simulateUrlRoute();
+
+      // Poll every 3 seconds
+      setInterval(() => {
+        fetchLiveStatus();
+      }, 3000);
+    });
+  </script>
+</body>
+</html>
