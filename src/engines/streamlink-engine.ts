@@ -4,7 +4,7 @@ import path from 'path';
 import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
 import { getStreamlinkPath } from '../utils/system.ts';
-import { remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
+import { remuxToTelegramMp4, validateMediaFile } from '../utils/ffmpeg.ts';
 import { logger } from '../logger.ts';
 
 export class StreamlinkEngine extends BaseEngine {
@@ -26,10 +26,11 @@ export class StreamlinkEngine extends BaseEngine {
   ): Promise<EngineResult> {
     const targetUrl = task.streamUrl || task.originalUrl;
     const streamlinkBin = getStreamlinkPath();
-    const rawOutput = path.join(task.tempDir, `streamlink_raw_${Date.now()}.ts`);
-    const finalMp4 = path.join(task.tempDir, `streamlink_output_${Date.now()}.mp4`);
+    const downloadDir = task.subDirs?.download || task.tempDir;
+    const rawOutput = path.join(downloadDir, `streamlink_raw_${Date.now()}.ts`);
+    const finalMp4 = path.join(downloadDir, `streamlink_output_${Date.now()}.mp4`);
 
-    onProgress?.('⬇️ Streamlink: Connecting to stream...', 30);
+    onProgress?.('⬇️ Streamlink: Connecting to stream (prioritizing max 720p)...', 30);
 
     const args: string[] = [
       '--force',
@@ -51,7 +52,8 @@ export class StreamlinkEngine extends BaseEngine {
       }
     }
 
-    args.push(targetUrl, 'best,worst');
+    // Prioritize 720p, then lower resolutions, avoiding 1080p/4k unless fallback
+    args.push(targetUrl, '720p,720p60,480p,360p,worst,best');
 
     return new Promise(resolve => {
       let stderr = '';
@@ -66,7 +68,7 @@ export class StreamlinkEngine extends BaseEngine {
         const text = data.toString();
         stdout += text;
         if (text.includes('[download]') || text.includes('Written')) {
-          onProgress?.(`⬇️ Streamlink downloading...`, 50);
+          onProgress?.(`⬇️ Streamlink downloading stream...`, 50);
         }
       });
 
@@ -88,6 +90,19 @@ export class StreamlinkEngine extends BaseEngine {
           onProgress?.('⚙️ Remuxing Streamlink stream with FFmpeg...', 85);
           try {
             await remuxToTelegramMp4(rawOutput, finalMp4);
+
+            const validation = await validateMediaFile(finalMp4);
+            if (!validation.valid) {
+              try { fs.unlinkSync(finalMp4); } catch {}
+              resolve({
+                success: false,
+                engineName: this.name,
+                error: `Streamlink output failed validation: ${validation.error}`,
+                errorType: 'INVALID_MEDIA',
+              });
+              return;
+            }
+
             resolve({
               success: true,
               outputPath: finalMp4,
@@ -98,6 +113,7 @@ export class StreamlinkEngine extends BaseEngine {
               success: false,
               engineName: this.name,
               error: `Streamlink remux failed: ${err.message}`,
+              errorType: 'FFMPEG_ERROR',
             });
           }
         } else {
@@ -107,6 +123,7 @@ export class StreamlinkEngine extends BaseEngine {
             success: false,
             engineName: this.name,
             error: errMsg.slice(0, 300),
+            errorType: 'EXTRACTOR_UNSUPPORTED',
           });
         }
       });
@@ -117,6 +134,7 @@ export class StreamlinkEngine extends BaseEngine {
           success: false,
           engineName: this.name,
           error: `Streamlink spawn error: ${err.message}`,
+          errorType: 'PROCESS_ERROR',
         });
       });
     });

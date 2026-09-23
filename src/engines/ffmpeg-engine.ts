@@ -4,6 +4,7 @@ import path from 'path';
 import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
 import { getFfmpegPath } from '../utils/system.ts';
+import { validateMediaFile } from '../utils/ffmpeg.ts';
 import { logger } from '../logger.ts';
 
 export class FfmpegEngine extends BaseEngine {
@@ -25,14 +26,15 @@ export class FfmpegEngine extends BaseEngine {
   ): Promise<EngineResult> {
     const targetUrl = task.streamUrl || task.originalUrl;
     const ffmpegBin = getFfmpegPath();
-    const finalMp4 = path.join(task.tempDir, `ffmpeg_output_${Date.now()}.mp4`);
+    const downloadDir = task.subDirs?.download || task.tempDir;
+    const finalMp4 = path.join(downloadDir, `ffmpeg_output_${Date.now()}.mp4`);
 
     onProgress?.('⬇️ FFmpeg: Connecting to HLS manifest & downloading segments...', 35);
 
     const args: string[] = ['-y'];
 
-    // Add protocol whitelist and headers
-    args.push('-protocol_whitelist', 'file,http,https,tcp,tls,crypto');
+    // Add protocol whitelist for HLS/crypto
+    args.push('-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data');
 
     if (task.streamHeaders) {
       let headerStr = '';
@@ -88,65 +90,75 @@ export class FfmpegEngine extends BaseEngine {
 
       task.abortController.signal.addEventListener('abort', abortHandler, { once: true });
 
-      proc.on('close', code => {
+      proc.on('close', async code => {
         task.abortController.signal.removeEventListener('abort', abortHandler);
 
         if (code === 0 && fs.existsSync(finalMp4) && fs.statSync(finalMp4).size > 1000) {
-          resolve({
-            success: true,
-            outputPath: finalMp4,
-            engineName: this.name,
-          });
-        } else {
-          // If stream copy failed due to incompatible codecs, retry with transcoding
-          logger.warn('FFmpeg copy failed, retrying with re-encode fallback...');
-          const transcodeProc = spawn(ffmpegBin, [
-            '-y',
-            '-protocol_whitelist',
-            'file,http,https,tcp,tls,crypto',
-            '-i',
-            targetUrl,
-            '-c:v',
-            'libx264',
-            '-preset',
-            'ultrafast',
-            '-c:a',
-            'aac',
-            '-movflags',
-            '+faststart',
-            finalMp4,
-          ]);
-
-          if (transcodeProc.pid) {
-            task.subprocesses.push(transcodeProc.pid);
+          const validation = await validateMediaFile(finalMp4);
+          if (validation.valid) {
+            resolve({
+              success: true,
+              outputPath: finalMp4,
+              engineName: this.name,
+            });
+            return;
           }
+        }
 
-          transcodeProc.on('close', c => {
-            if (c === 0 && fs.existsSync(finalMp4) && fs.statSync(finalMp4).size > 1000) {
+        // If stream copy failed due to incompatible codecs or variant issues, retry with transcoding
+        logger.warn('FFmpeg copy failed, retrying with re-encode fallback...');
+        const transcodeProc = spawn(ffmpegBin, [
+          '-y',
+          '-protocol_whitelist',
+          'file,http,https,tcp,tls,crypto,data',
+          '-i',
+          targetUrl,
+          '-c:v',
+          'libx264',
+          '-preset',
+          'ultrafast',
+          '-c:a',
+          'aac',
+          '-movflags',
+          '+faststart',
+          finalMp4,
+        ]);
+
+        if (transcodeProc.pid) {
+          task.subprocesses.push(transcodeProc.pid);
+        }
+
+        transcodeProc.on('close', async c => {
+          if (c === 0 && fs.existsSync(finalMp4) && fs.statSync(finalMp4).size > 1000) {
+            const validation = await validateMediaFile(finalMp4);
+            if (validation.valid) {
               resolve({
                 success: true,
                 outputPath: finalMp4,
                 engineName: this.name,
               });
-            } else {
-              const errMsg = stderr || `FFmpeg failed with exit code ${code}`;
-              logger.warn(`FFmpeg engine failed: ${errMsg.slice(-250)}`);
-              resolve({
-                success: false,
-                engineName: this.name,
-                error: errMsg.slice(0, 300),
-              });
+              return;
             }
-          });
+          }
 
-          transcodeProc.on('error', err => {
-            resolve({
-              success: false,
-              engineName: this.name,
-              error: `FFmpeg transcode error: ${err.message}`,
-            });
+          const errMsg = stderr || `FFmpeg failed with exit code ${code}`;
+          logger.warn(`FFmpeg engine failed: ${errMsg.slice(-250)}`);
+          resolve({
+            success: false,
+            engineName: this.name,
+            error: errMsg.slice(0, 300),
+            errorType: 'FFMPEG_ERROR',
           });
-        }
+        });
+
+        transcodeProc.on('error', err => {
+          resolve({
+            success: false,
+            engineName: this.name,
+            error: `FFmpeg transcode error: ${err.message}`,
+            errorType: 'PROCESS_ERROR',
+          });
+        });
       });
 
       proc.on('error', err => {
@@ -155,6 +167,7 @@ export class FfmpegEngine extends BaseEngine {
           success: false,
           engineName: this.name,
           error: `FFmpeg execution error: ${err.message}`,
+          errorType: 'PROCESS_ERROR',
         });
       });
     });

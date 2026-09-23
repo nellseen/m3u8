@@ -1,16 +1,25 @@
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import { extractUrlsFromText, analyzeUrl } from '../src/utils/url-extractor.ts';
-import { DownloadQueue } from '../src/queue/download-queue.ts';
 import { FallbackOrchestrator } from '../src/engines/orchestrator.ts';
-import { probeMedia, generateThumbnail, remuxToTelegramMp4 } from '../src/utils/ffmpeg.ts';
-import { cleanupTaskTemp } from '../src/utils/cleaner.ts';
+import {
+  probeMedia,
+  validateMediaFile,
+  enforceMax720p,
+  generateThumbnailAt25s,
+  remuxToTelegramMp4,
+} from '../src/utils/ffmpeg.ts';
+import { createTaskDirectories, cleanupTaskTemp } from '../src/utils/cleaner.ts';
+import { ensureIndonesianTitle, isLikelyIndonesian } from '../src/utils/translator.ts';
+import { extractHtmlMetadata } from '../src/utils/metadata.ts';
+import { getAvailableDiskSpace } from '../src/utils/system.ts';
 import { config } from '../src/config.ts';
 import { DownloadTask } from '../src/types.ts';
 
 async function runSelfAudit() {
   console.log('\n========================================================');
-  console.log('       🛠️ Running Self-Audit & Pipeline Verification    ');
+  console.log('       🛠️ Running Complete Self-Audit & Verification    ');
   console.log('========================================================\n');
 
   let passed = 0;
@@ -28,7 +37,8 @@ async function runSelfAudit() {
 
   // TEST 1: URL Detection and Extraction
   console.log('\n--- 1. Testing URL Extraction & Detection ---');
-  const sampleText = 'Check out this video: https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8 and also http://example.com/video.mp4!';
+  const sampleText =
+    'Check out this video: https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8 and also http://example.com/video.mp4!';
   const extracted = extractUrlsFromText(sampleText);
   assert(extracted.length === 2, 'Extract multiple URLs from text', `Found: ${extracted.length}`);
   assert(extracted[0] === 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8', 'Extract M3U8 URL cleanly');
@@ -40,101 +50,200 @@ async function runSelfAudit() {
   const mp4Analysis = analyzeUrl('https://example.com/files/sample.mp4');
   assert(mp4Analysis.isDirectVideo === true, 'Classify direct MP4 URL');
 
-  // TEST 2: Engines Initialization & Availability
-  console.log('\n--- 2. Testing Fallback Orchestrator Engines ---');
+  // TEST 2: Indonesian Translation & Detection Pipeline
+  console.log('\n--- 2. Testing Indonesian Title Translation & Fallback ---');
+  const idText = 'Video Cara Memasak Rendang Daging Sapi Enak';
+  assert(isLikelyIndonesian(idText), 'Detect Indonesian title natively');
+
+  const idResult = await ensureIndonesianTitle(idText);
+  assert(
+    idResult.translationStatus === 'not_needed' && idResult.translatedTitle === idText,
+    'Preserve title if already Indonesian'
+  );
+
+  const enText = 'Amazing Nature 4K Drone Footage in Switzerland';
+  const enResult = await ensureIndonesianTitle(enText);
+  assert(
+    enResult.translationStatus === 'translated' && enResult.translatedTitle.length > 0,
+    'Translate foreign title to Indonesian',
+    `"${enResult.translatedTitle}"`
+  );
+
+  // Fallback check: empty title
+  const emptyResult = await ensureIndonesianTitle('');
+  assert(emptyResult.translationStatus === 'not_needed', 'Handle empty title safely without dummy data');
+
+  // TEST 3: Metadata Extraction from HTML
+  console.log('\n--- 3. Testing HTML & JSON-LD Metadata Extraction ---');
+  const mockHtml = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Wildlife Safari in Africa - Official Documentary</title>
+        <meta name="description" content="A breathtaking journey into the wild African savanna." />
+        <meta property="og:title" content="Wildlife Safari in Africa" />
+        <meta property="og:image" content="https://example.com/poster.jpg" />
+        <meta property="og:site_name" content="NatureDocs" />
+        <script type="application/ld+json">
+          {
+            "@type": "VideoObject",
+            "name": "Wildlife Safari in Africa",
+            "description": "A breathtaking journey into the wild African savanna.",
+            "thumbnailUrl": "https://example.com/poster.jpg",
+            "duration": "PT2M30S"
+          }
+        </script>
+      </head>
+      <body>
+        <video poster="https://example.com/poster.jpg"></video>
+      </body>
+    </html>
+  `;
+  const extractedMeta = await extractHtmlMetadata(mockHtml, 'https://example.com/wildlife');
+  assert(extractedMeta.originalTitle === 'Wildlife Safari in Africa', 'Extract original title from OpenGraph/JSON-LD');
+  assert(extractedMeta.duration === 150, 'Extract video duration from ISO 8601 (PT2M30S = 150s)');
+  assert(extractedMeta.thumbnail === 'https://example.com/poster.jpg', 'Extract thumbnail candidate');
+  assert(Boolean(extractedMeta.translatedTitle), 'Translate extracted title to Indonesian', `"${extractedMeta.translatedTitle}"`);
+
+  // TEST 4: Fallback Orchestrator Engines Registration
+  console.log('\n--- 4. Testing Fallback Orchestrator Engines ---');
   const orchestrator = new FallbackOrchestrator();
   const engines = orchestrator.getEngines();
-  assert(engines.length === 5, 'Orchestrator registers 5 fallback engines', `Registered: ${engines.length}`);
+  assert(engines.length === 6, 'Orchestrator registers 6 fallback engines', `Registered: ${engines.length}`);
 
   for (const eng of engines) {
     const avail = await eng.isAvailable();
     console.log(`   • ${eng.name}: ${avail ? '\x1b[32mAvailable\x1b[0m' : '\x1b[33mUnavailable\x1b[0m'}`);
   }
 
-  // TEST 3: Temporary Directory Isolation & Cleanup
-  console.log('\n--- 3. Testing Temporary Directory Isolation ---');
-  const testTaskId = `audit_${Date.now()}`;
-  const testTempDir = path.join(config.tempDir, testTaskId);
-  fs.mkdirSync(testTempDir, { recursive: true });
-  const dummyFile = path.join(testTempDir, 'dummy.tmp');
-  fs.writeFileSync(dummyFile, 'audit test payload');
+  // TEST 5: Storage Protection & Task Subdirectories Isolation
+  console.log('\n--- 5. Testing Storage Protection & Directory Isolation ---');
+  const freeDisk = getAvailableDiskSpace(config.tempDir);
+  assert(freeDisk > 100 * 1024 * 1024, 'Storage check verifies free disk space', `${(freeDisk / (1024 * 1024)).toFixed(1)} MB free`);
 
-  assert(fs.existsSync(dummyFile), 'Created isolated job temp directory and file');
+  const testTaskId = `audit_sub_${Date.now()}`;
+  const { tempDir: jobTempDir, subDirs } = createTaskDirectories(config.tempDir, testTaskId);
+  assert(fs.existsSync(subDirs.source), 'Created subDir source/');
+  assert(fs.existsSync(subDirs.download), 'Created subDir download/');
+  assert(fs.existsSync(subDirs.processed), 'Created subDir processed/');
+  assert(fs.existsSync(subDirs.thumbnail), 'Created subDir thumbnail/');
+  assert(fs.existsSync(subDirs.logs), 'Created subDir logs/');
 
   const dummyTask: DownloadTask = {
     id: testTaskId,
     originalUrl: 'https://example.com',
     chatId: 12345,
     messageId: 1,
-    status: 'detecting',
+    status: 'detecting_url',
     failedEngines: [],
-    tempDir: testTempDir,
+    tempDir: jobTempDir,
+    subDirs,
     startTime: Date.now(),
     abortController: new AbortController(),
     subprocesses: [],
   };
 
   await cleanupTaskTemp(dummyTask);
-  assert(!fs.existsSync(testTempDir), 'cleanupTaskTemp successfully purged isolated job directory');
+  assert(!fs.existsSync(jobTempDir), 'cleanupTaskTemp successfully purged isolated job directory');
 
-  // TEST 4: FFmpeg Synthetic Video Generation & Probing
-  console.log('\n--- 4. Testing FFmpeg Probing & Remuxing ---');
-  const sampleVideo = path.join(config.tempDir, `sample_test_${Date.now()}.mp4`);
-  const sampleThumb = path.join(config.tempDir, `sample_thumb_${Date.now()}.jpg`);
-  const remuxOutput = path.join(config.tempDir, `sample_remuxed_${Date.now()}.mp4`);
+  // TEST 6: FFmpeg Media Validation & Probing
+  console.log('\n--- 6. Testing FFmpeg Probing & Validation ---');
+  const sampleVideo360p = path.join(config.tempDir, `sample_360p_${Date.now()}.mp4`);
+  const sampleVideo1080p = path.join(config.tempDir, `sample_1080p_${Date.now()}.mp4`);
 
-  // Generate 2-second synthetic color bar video with tone audio via ffmpeg
-  const { execSync } = await import('child_process');
+  // Generate 2-second 640x360 synthetic test video
   execSync(
-    `ffmpeg -y -f lavfi -i testsrc=duration=2:size=640x360:rate=30 -f lavfi -i sine=frequency=1000:duration=2 -c:v libx264 -c:a aac "${sampleVideo}"`,
+    `ffmpeg -y -f lavfi -i testsrc=duration=2:size=640x360:rate=30 -f lavfi -i sine=frequency=1000:duration=2 -c:v libx264 -c:a aac "${sampleVideo360p}"`,
     { stdio: 'ignore' }
   );
+  assert(fs.existsSync(sampleVideo360p), 'Generated 360p synthetic video via FFmpeg');
 
-  assert(fs.existsSync(sampleVideo), 'Generated synthetic test video via FFmpeg');
-
-  const probe = await probeMedia(sampleVideo);
+  const probe = await probeMedia(sampleVideo360p);
   assert(typeof probe.duration === 'number' && probe.duration > 1.5, 'Probe media duration', `${probe.duration}s`);
   assert(probe.width === 640 && probe.height === 360, 'Probe video dimensions', `${probe.width}x${probe.height}`);
 
-  const thumbSuccess = await generateThumbnail(sampleVideo, sampleThumb);
-  assert(thumbSuccess && fs.existsSync(sampleThumb), 'Generate video thumbnail image via FFmpeg');
+  const validation = await validateMediaFile(sampleVideo360p);
+  assert(validation.valid === true, 'validateMediaFile confirms valid container and streams');
 
-  const remuxSuccess = await remuxToTelegramMp4(sampleVideo, remuxOutput);
-  assert(remuxSuccess && fs.existsSync(remuxOutput), 'Faststart MP4 remux for Telegram streaming');
+  // TEST 7: Max 720p Resolution Policy (Downscaling >720p, NO Upscaling <=720p)
+  console.log('\n--- 7. Testing 720p Resolution Enforcement (Max 720p, No Upscaling) ---');
 
-  // Clean up synthetic test files
+  // 7a. Native <= 720p must NOT be upscaled
+  const nativeOutput = path.join(config.tempDir, `native_output_${Date.now()}.mp4`);
+  const { meta: nativeMeta } = await enforceMax720p(sampleVideo360p, nativeOutput);
+  assert(
+    nativeMeta.height === 360 && nativeMeta.width === 640,
+    'DO NOT upscale video: 360p preserved as 360p',
+    `${nativeMeta.width}x${nativeMeta.height}`
+  );
+
+  // 7b. High resolution (>720p) must be downscaled to max 720p preserving aspect ratio
+  execSync(
+    `ffmpeg -y -f lavfi -i testsrc=duration=2:size=1920x1080:rate=30 -f lavfi -i sine=frequency=1000:duration=2 -c:v libx264 -c:a aac "${sampleVideo1080p}"`,
+    { stdio: 'ignore' }
+  );
+  assert(fs.existsSync(sampleVideo1080p), 'Generated 1080p synthetic video via FFmpeg');
+
+  const downscaledOutput = path.join(config.tempDir, `downscaled_output_${Date.now()}.mp4`);
+  const { meta: downscaledMeta } = await enforceMax720p(sampleVideo1080p, downscaledOutput);
+  assert(
+    downscaledMeta.height === 720 && downscaledMeta.width === 1280,
+    'Downscale 1080p to max 720p (1280x720) preserving aspect ratio',
+    `${downscaledMeta.width}x${downscaledMeta.height}`
+  );
+
+  // TEST 8: Thumbnail Extraction @ 25s with Safe Fallback
+  console.log('\n--- 8. Testing Thumbnail Generation @ 25s with Safe Fallback ---');
+  const thumbOut = path.join(config.tempDir, `thumb_test_${Date.now()}.jpg`);
+  // For a 2-second video, safe fraction should be used without crashing
+  const thumbResult = await generateThumbnailAt25s(downscaledOutput, thumbOut, 2);
+  assert(
+    Boolean(thumbResult && fs.existsSync(thumbOut) && fs.statSync(thumbOut).size > 100),
+    'Generate video thumbnail within valid duration bounds'
+  );
+
+  // Clean up synthetic media files
   try {
-    fs.unlinkSync(sampleVideo);
-    fs.unlinkSync(sampleThumb);
-    fs.unlinkSync(remuxOutput);
+    fs.unlinkSync(sampleVideo360p);
+    fs.unlinkSync(sampleVideo1080p);
+    fs.unlinkSync(nativeOutput);
+    fs.unlinkSync(downscaledOutput);
+    if (fs.existsSync(thumbOut)) fs.unlinkSync(thumbOut);
   } catch {}
 
-  // TEST 5: Fallback Orchestrator with Failure Recovery
-  console.log('\n--- 5. Testing Fallback Execution when an engine fails ---');
+  // TEST 9: Fallback Orchestrator with Failure Recovery
+  console.log('\n--- 9. Testing Fallback Execution when engines fail ---');
   const fallbackTaskId = `fallback_audit_${Date.now()}`;
-  const fallbackTemp = path.join(config.tempDir, fallbackTaskId);
-  fs.mkdirSync(fallbackTemp, { recursive: true });
+  const { tempDir: fallbackTemp, subDirs: fallbackSubDirs } = createTaskDirectories(
+    config.tempDir,
+    fallbackTaskId
+  );
 
   const fallbackTask: DownloadTask = {
     id: fallbackTaskId,
-    originalUrl: 'https://httpstat.us/404', // Guaranteed 404
+    originalUrl: 'http://127.0.0.1:59999/not-found', // Immediate connection failure
     chatId: 9999,
     messageId: 2,
-    status: 'detecting',
+    status: 'detecting_url',
     failedEngines: [],
     tempDir: fallbackTemp,
+    subDirs: fallbackSubDirs,
     startTime: Date.now(),
     abortController: new AbortController(),
     subprocesses: [],
   };
 
   const fallbackResult = await orchestrator.executeWithFallback(fallbackTask);
-  assert(fallbackResult.success === false, 'Orchestrator handles 404 stream correctly');
-  assert(fallbackTask.failedEngines.length > 0, 'Orchestrator recorded failed engines', `Failed count: ${fallbackTask.failedEngines.length}`);
+  assert(fallbackResult.success === false, 'Orchestrator handles unreachable stream correctly');
+  assert(
+    fallbackTask.failedEngines.length > 0,
+    'Orchestrator recorded failed engines with error classification',
+    `Failed engines: ${fallbackTask.failedEngines.length}`
+  );
   await cleanupTaskTemp(fallbackTask);
 
-  // TEST 6: Real Downloader Pipeline with HLS (.m3u8) Stream
-  console.log('\n--- 6. Testing Downloader Pipeline with Synthetic HLS (.m3u8) Manifest ---');
+  // TEST 10: Real Downloader Pipeline with Synthetic HLS (.m3u8) Stream
+  console.log('\n--- 10. Testing Downloader Pipeline with Synthetic HLS (.m3u8) Manifest ---');
   const hlsLocalDir = path.join(config.tempDir, `hls_source_${Date.now()}`);
   fs.mkdirSync(hlsLocalDir, { recursive: true });
   const hlsManifest = path.join(hlsLocalDir, 'test_stream.m3u8');
@@ -147,28 +256,32 @@ async function runSelfAudit() {
   assert(fs.existsSync(hlsManifest), 'Generated test HLS playlist (.m3u8) with segments');
 
   const hlsTaskId = `hls_audit_${Date.now()}`;
-  const hlsTemp = path.join(config.tempDir, hlsTaskId);
-  fs.mkdirSync(hlsTemp, { recursive: true });
+  const { tempDir: hlsTemp, subDirs: hlsSubDirs } = createTaskDirectories(config.tempDir, hlsTaskId);
 
   const hlsTask: DownloadTask = {
     id: hlsTaskId,
     originalUrl: hlsManifest,
     chatId: 8888,
     messageId: 3,
-    status: 'detecting',
+    status: 'detecting_url',
     failedEngines: [],
     tempDir: hlsTemp,
+    subDirs: hlsSubDirs,
     startTime: Date.now(),
     abortController: new AbortController(),
     subprocesses: [],
   };
 
   console.log('   Downloading HLS stream through fallback pipeline...');
-  const hlsResult = await orchestrator.executeWithFallback(hlsTask, (text) => {
+  const hlsResult = await orchestrator.executeWithFallback(hlsTask, text => {
     console.log(`   [Progress] ${text}`);
   });
 
-  assert(hlsResult.success === true, 'HLS Pipeline downloaded sample stream successfully', `Engine: ${hlsResult.engineName}`);
+  assert(
+    hlsResult.success === true,
+    'HLS Pipeline downloaded sample stream successfully',
+    `Engine: ${hlsResult.engineName}`
+  );
   if (hlsResult.outputPath) {
     const stat = fs.statSync(hlsResult.outputPath);
     assert(stat.size > 1000, 'Downloaded HLS MP4 output has valid size', `${stat.size} bytes`);

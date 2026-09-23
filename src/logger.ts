@@ -73,4 +73,14 @@ export const logger = {
   warn: (msg: string, ...args: unknown[]) => log('WARN', msg, ...args),
   error: (msg: string, ...args: unknown[]) => log('ERROR', msg, ...args),
   debug: (msg: string, ...args: unknown[]) => log('DEBUG', msg, ...args),
+  taskError: (
+    taskId: string,
+    engine: string,
+    stage: string,
+    errorType: string,
+    message: string
+  ) => {
+    log('ERROR', `[${taskId}] [${engine}] [${stage}] [${errorType}] ${message}`);
+  },
 };
+

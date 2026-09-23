@@ -1,6 +1,31 @@
 import { TelegramClient } from 'telegram';
 import { logger } from '../logger.ts';
 
+export type ProgressStage =
+  | 'detecting_url'
+  | 'extracting_metadata'
+  | 'finding_media'
+  | 'downloading'
+  | 'processing'
+  | 'limiting_resolution'
+  | 'generating_thumbnail'
+  | 'uploading'
+  | 'completed'
+  | 'failed';
+
+const STAGE_LABELS: Record<ProgressStage, string> = {
+  detecting_url: '🔎 Detecting URL',
+  extracting_metadata: '🌐 Extracting metadata',
+  finding_media: '🧭 Finding media',
+  downloading: '⬇️ Downloading',
+  processing: '⚙️ Processing',
+  limiting_resolution: '📐 Limiting to 720p',
+  generating_thumbnail: '🖼️ Generating thumbnail',
+  uploading: '📤 Uploading',
+  completed: '✅ Completed',
+  failed: '❌ Download failed',
+};
+
 export class ProgressTracker {
   private client: TelegramClient;
   private chatId: any;
@@ -14,6 +39,12 @@ export class ProgressTracker {
     this.client = client;
     this.chatId = chatId;
     this.messageId = messageId;
+  }
+
+  async setStage(stage: ProgressStage, detail?: string, force = false): Promise<void> {
+    const label = STAGE_LABELS[stage] || stage;
+    const text = detail ? `${label}\n${detail}` : label;
+    await this.update(text, force);
   }
 
   async update(text: string, force = false): Promise<void> {
@@ -30,7 +61,7 @@ export class ProgressTracker {
       }
       await this.doEdit(text);
     } else {
-      // Schedule trailing update
+      // Schedule trailing update to prevent hitting Telegram flood limits
       if (!this.pendingUpdateTimeout) {
         const delay = Math.max(200, 1500 - timeSinceLastEdit);
         this.pendingUpdateTimeout = setTimeout(async () => {
@@ -41,13 +72,13 @@ export class ProgressTracker {
     }
   }
 
-  async markDone(summaryText: string): Promise<void> {
+  async markDone(summaryText?: string): Promise<void> {
     this.isFinished = true;
     if (this.pendingUpdateTimeout) {
       clearTimeout(this.pendingUpdateTimeout);
       this.pendingUpdateTimeout = null;
     }
-    await this.doEdit(summaryText);
+    await this.doEdit(summaryText || '✅ Completed');
   }
 
   async markFailed(errorText: string): Promise<void> {
@@ -56,7 +87,20 @@ export class ProgressTracker {
       clearTimeout(this.pendingUpdateTimeout);
       this.pendingUpdateTimeout = null;
     }
-    await this.doEdit(errorText);
+    const fullText = `❌ Download failed\n\n${errorText}`;
+    await this.doEdit(fullText);
+  }
+
+  async delete(): Promise<void> {
+    try {
+      if (this.pendingUpdateTimeout) {
+        clearTimeout(this.pendingUpdateTimeout);
+        this.pendingUpdateTimeout = null;
+      }
+      await this.client.deleteMessages(this.chatId, [this.messageId], { revoke: true });
+    } catch {
+      // Ignore delete errors
+    }
   }
 
   private async doEdit(text: string): Promise<void> {
@@ -70,7 +114,7 @@ export class ProgressTracker {
       });
     } catch (err: any) {
       const errMsg = String(err?.message || err);
-      // Ignore "message is not modified" or minor floodwait
+      // Ignore standard "message is not modified"
       if (!errMsg.includes('MESSAGE_NOT_MODIFIED')) {
         logger.debug(`Failed to edit progress message ${this.messageId}:`, errMsg);
       }

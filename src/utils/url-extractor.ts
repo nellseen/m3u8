@@ -37,7 +37,12 @@ export function isValidHttpUrl(string: string): boolean {
 
 export function analyzeUrl(url: string): DetectedUrl {
   const lower = url.toLowerCase();
-  const pathname = new URL(url).pathname.toLowerCase();
+  let pathname = '';
+  try {
+    pathname = new URL(url).pathname.toLowerCase();
+  } catch {
+    pathname = lower;
+  }
 
   const isDirectM3u8 = pathname.endsWith('.m3u8') || lower.includes('.m3u8?') || lower.includes('.m3u8&');
   const isDirectMpd = pathname.endsWith('.mpd') || lower.includes('.mpd?') || lower.includes('.mpd&');

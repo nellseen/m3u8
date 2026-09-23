@@ -1,8 +1,13 @@
+packages:
+  - '.'
+
+# Settings to handle peer dependency resolution in Termux/Proot environments
 allowBuilds:
-  '@google/genai': set this to true or false
-  bufferutil: true
-  core-js: true
-  es5-ext: true
-  esbuild: true
-  protobufjs: set this to true or false
-  utf-8-validate: true
+  bufferutil: set this to true or false
+  core-js: set this to true or false
+  es5-ext: set this to true or false
+  esbuild: set this to true or false
+  utf-8-validate: set this to true or false
+autoInstallPeers: true
+strictPeerDependencies: false
+

@@ -1,16 +1,18 @@
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
 import { chromium } from 'playwright';
 import { config, isConfigured } from '../src/config.ts';
 import {
   isCommandAvailable,
   getCommandOutput,
   getFfmpegPath,
+  getFfprobePath,
   getYtdlpPath,
   getStreamlinkPath,
   getChromiumPath,
   isTermuxOrPRoot,
+  getAvailableDiskSpace,
+  formatBytes,
 } from '../src/utils/system.ts';
 import { DoctorCheckItem } from '../src/types.ts';
 
@@ -45,6 +47,17 @@ async function runDoctor() {
   console.log('\n======================================================');
   console.log('   🔍 Telegram Userbot - System & Doctor Diagnostics');
   console.log('======================================================\n');
+
+  // Summary state indicators
+  const readyStatus: Record<string, { ready: boolean; note?: string }> = {
+    'Direct HLS': { ready: true },
+    'Playwright': { ready: false },
+    'Chromium': { ready: false },
+    'Streamlink': { ready: false },
+    'yt-dlp': { ready: false },
+    'FFmpeg': { ready: false },
+    'Telegram': { ready: false },
+  };
 
   // 1. Environment Check
   check('Environment', 'Runtime Environment', () => {
@@ -89,8 +102,9 @@ async function runDoctor() {
     const bin = getFfmpegPath();
     const out = getCommandOutput(`"${bin}" -version`);
     if (out) {
+      readyStatus['FFmpeg'].ready = true;
       const firstLine = out.split('\n')[0];
-      return { pass: true, details: `${bin} (${firstLine.slice(0, 40)}...)` };
+      return { pass: true, details: `${bin} (${firstLine.slice(0, 30)}...)` };
     }
     return {
       pass: false,
@@ -99,16 +113,33 @@ async function runDoctor() {
     };
   });
 
+  // 4b. ffprobe
+  check('Binaries', 'ffprobe Media Analyzer', () => {
+    const bin = getFfprobePath();
+    const out = getCommandOutput(`"${bin}" -version`);
+    if (out) {
+      return { pass: true, details: `${bin} (available)` };
+    }
+    return {
+      pass: true,
+      warn: true,
+      details: 'ffprobe not found, will fallback to ffmpeg inspection',
+      remedy: 'Install ffmpeg/ffprobe via package manager',
+    };
+  });
+
   // 5. yt-dlp
   check('Binaries', 'yt-dlp Video Downloader', () => {
     const bin = getYtdlpPath();
     const out = getCommandOutput(`"${bin}" --version`);
     if (out) {
+      readyStatus['yt-dlp'].ready = true;
       return { pass: true, details: `${bin} (version ${out})` };
     }
     return {
-      pass: false,
-      details: 'yt-dlp binary not found',
+      pass: true,
+      warn: true,
+      details: 'yt-dlp binary not found (optional engine)',
       remedy: 'Install yt-dlp: run "pip3 install --break-system-packages yt-dlp" or "bash scripts/setup.sh"',
     };
   });
@@ -118,35 +149,43 @@ async function runDoctor() {
     const bin = getStreamlinkPath();
     const out = getCommandOutput(`"${bin}" --version`);
     if (out) {
+      readyStatus['Streamlink'].ready = true;
       return { pass: true, details: `${bin} (${out.split('\n')[0]})` };
     }
     return {
-      pass: false,
-      details: 'streamlink not found in PATH',
+      pass: true,
+      warn: true,
+      details: 'streamlink not found in PATH (optional engine)',
       remedy: 'Install Streamlink: run "pip3 install --break-system-packages streamlink" or "bash scripts/setup.sh"',
     };
   });
 
   // 7. Chromium & Playwright
-  console.log('Testing Playwright / Chromium headless launch (may take a moment)...');
+  console.log('Testing Playwright / Chromium launch...');
   let playwrightPass = false;
+  let chromiumPass = false;
   let playwrightDetail = '';
   let playwrightRemedy = '';
+
   try {
     const execPath = getChromiumPath();
     const browser = await chromium.launch({
       executablePath: execPath,
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-      timeout: 15000,
+      timeout: 10000,
     });
-    playwrightDetail = `Browser launch OK (version: ${browser.version()})`;
+    playwrightDetail = `Browser launch OK (v${browser.version()})`;
     await browser.close();
     playwrightPass = true;
+    chromiumPass = true;
+    readyStatus['Playwright'].ready = true;
+    readyStatus['Chromium'].ready = true;
   } catch (err: any) {
-    playwrightDetail = `Playwright launch failed: ${err.message?.slice(0, 70)}`;
+    playwrightDetail = `Playwright launch note: ${err.message?.slice(0, 60)}`;
     playwrightRemedy = 'Run "npx playwright install --with-deps chromium" or "apt-get install -y chromium-browser"';
   }
+
   checks.push({
     category: 'Binaries',
     name: 'Playwright / Chromium Sniffer',
@@ -155,7 +194,7 @@ async function runDoctor() {
     remedy: playwrightRemedy,
   });
 
-  // 8. Package Installation (node_modules check)
+  // 8. Package Installation (GramJS / telegram check)
   try {
     const tg = await import('telegram');
     checks.push({
@@ -174,48 +213,51 @@ async function runDoctor() {
     });
   }
 
-  // 9. Executable PATH check
-  check('Environment', 'System Executable PATH', () => {
-    const currentPath = process.env.PATH || '';
-    const hasLocalBin = currentPath.includes('/usr/local/bin') || currentPath.includes('/usr/bin');
-    if (hasLocalBin) {
-      return { pass: true, details: `PATH verified (${currentPath.split(':').length} directories)` };
+  // 9. Storage & Free Disk Protection
+  check('Filesystem', 'Storage & Disk Space', () => {
+    const freeBytes = getAvailableDiskSpace(config.tempDir);
+    const freeFormatted = formatBytes(freeBytes);
+    if (freeBytes > 500 * 1024 * 1024) {
+      return { pass: true, details: `${freeFormatted} free disk space` };
+    }
+    if (freeBytes > 250 * 1024 * 1024) {
+      return { pass: true, warn: true, details: `${freeFormatted} free (storage low)` };
     }
     return {
       pass: false,
-      warn: true,
-      details: 'Standard binary paths may be missing from PATH',
-      remedy: 'Ensure /usr/local/bin and /usr/bin are in your PATH environment variable.',
+      details: `Critically low storage: ${freeFormatted} free`,
+      remedy: 'Free up disk space on your machine.',
     };
   });
 
-  // 9. Filesystem & Directory Permissions
+  // 10. Filesystem & Directory Permissions
   check('Filesystem', 'Runtime Directories & Permissions', () => {
     const dirs = [config.tempDir, config.outputDir, config.logDir];
     for (const d of dirs) {
       if (!fs.existsSync(d)) {
         fs.mkdirSync(d, { recursive: true });
       }
-      // Test write & delete
       const testFile = path.join(d, `.perm_test_${Date.now()}`);
       fs.writeFileSync(testFile, 'ok');
       fs.unlinkSync(testFile);
     }
     return {
       pass: true,
-      details: `Write/read verified: temp (${config.tempDir}), output (${config.outputDir}), logs (${config.logDir})`,
+      details: `Write/read verified: temp, output, logs`,
     };
   });
 
-  // 10. Telegram Configuration
+  // 11. Telegram Configuration
   check('Telegram', 'API Credentials & Session', () => {
     const hasConfig = isConfigured();
     const hasSession = Boolean(config.session);
 
     if (hasConfig && hasSession) {
+      readyStatus['Telegram'].ready = true;
       return { pass: true, details: 'API ID, API HASH, and Session String are loaded' };
     }
     if (hasConfig && !hasSession) {
+      readyStatus['Telegram'].note = 'SESSION MISSING';
       return {
         pass: true,
         warn: true,
@@ -223,11 +265,27 @@ async function runDoctor() {
         remedy: 'Run "pnpm run login" in your terminal to authenticate your Telegram account.',
       };
     }
+    readyStatus['Telegram'].note = 'NOT CONFIGURED';
     return {
       pass: false,
       warn: true,
-      details: 'TELEGRAM_API_ID and TELEGRAM_API_HASH belum diisi',
-      remedy: 'Cukup jalankan "pnpm run login" di terminal untuk memasukkan API ID & Hash secara interaktif tanpa perlu mengedit file secara manual.',
+      details: 'TELEGRAM_API_ID and TELEGRAM_API_HASH are not set in .env',
+      remedy: 'Run "pnpm run login" in terminal to configure and login to Telegram.',
+    };
+  });
+
+  // 12. Executable PATH check
+  check('Environment', 'System Executable PATH', () => {
+    const currentPath = process.env.PATH || '';
+    const hasLocalBin = currentPath.includes('/usr/local/bin') || currentPath.includes('/usr/bin');
+    if (hasLocalBin) {
+      return { pass: true, details: `PATH verified (${currentPath.split(':').length} dirs)` };
+    }
+    return {
+      pass: false,
+      warn: true,
+      details: 'Standard binary paths may be missing from PATH',
+      remedy: 'Ensure /usr/local/bin and /usr/bin are in your PATH environment variable.',
     };
   });
 
@@ -251,6 +309,21 @@ async function runDoctor() {
   }
   console.log('--------------------------------------------------------------------------------------------------\n');
 
+  // Print Engine Readiness Summary (Requirement 22)
+  console.log('======================================================');
+  console.log('            🚀 Engine & Service Readiness             ');
+  console.log('======================================================');
+  for (const [engine, info] of Object.entries(readyStatus)) {
+    const label = engine.padEnd(16);
+    if (info.ready) {
+      console.log(`${label} \x1b[32mREADY\x1b[0m`);
+    } else {
+      const note = info.note ? ` (${info.note})` : ' (NOT INSTALLED / UNAVAILABLE)';
+      console.log(`${label} \x1b[33mNOT READY\x1b[0m${note}`);
+    }
+  }
+  console.log('======================================================\n');
+
   // Print Remedies if any failed or warned
   const issues = checks.filter(c => c.status !== 'PASS');
   if (issues.length > 0) {
@@ -269,12 +342,11 @@ async function runDoctor() {
   const warnCount = checks.filter(c => c.status === 'WARN').length;
   const failCount = checks.filter(c => c.status === 'FAIL').length;
 
-  console.log(`Doctor Summary: \x1b[32m${passCount} PASS\x1b[0m, \x1b[33m${warnCount} WARN\x1b[0m, \x1b[31m${failCount} FAIL\x1b[0m`);
+  console.log(`Doctor Summary: \x1b[32m${passCount} PASS\x1b[0m, \x1b[33m${warnCount} WARN\x1b[0m, \x1b[31m${failCount} FAIL\x1b[0m\n`);
 
   if (failCount > 0) {
     process.exit(1);
   } else {
-    console.log('\x1b[32mSystem is ready to run the Telegram Userbot!\x1b[0m\n');
     process.exit(0);
   }
 }

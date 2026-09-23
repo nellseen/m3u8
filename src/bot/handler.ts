@@ -30,11 +30,9 @@ export class BotHandler {
     const rawText = message.text.trim();
     const prefix = config.commandPrefix;
 
-    // Identify chat context
     const chatId = message.peerId;
     const isPrivate = message.isPrivate;
     const isGroup = message.isGroup;
-    const isChannel = message.isChannel;
 
     // Check if message is from Saved Messages / Self
     const me = getCurrentUser();
@@ -84,15 +82,16 @@ export class BotHandler {
     if (rawText === `${prefix}help`) {
       let helpText = `🎬 **Telegram HLS/M3U8 Userbot Downloader**\n\n`;
       helpText += `**Commands:**\n`;
-      helpText += `• \`${prefix}dl <url>\` : Download video with multi-layer fallback\n`;
+      helpText += `• \`${prefix}dl <url>\` : Download video with 6-engine fallback & auto 720p cap\n`;
       helpText += `• \`${prefix}status\` : Check active download queue\n`;
       helpText += `• \`${prefix}ping\` : Check bot latency\n`;
       helpText += `• \`${prefix}help\` : Show this command list\n\n`;
-      helpText += `**Supported Formats:**\n`;
-      helpText += `• Direct .m3u8 (HLS playlists / live / VOD)\n`;
-      helpText += `• Embedded web video players (Playwright sniffing)\n`;
-      helpText += `• Streamlink & yt-dlp supported streams\n`;
-      helpText += `• Direct MP4, WebM, MKV streams\n\n`;
+      helpText += `**Features:**\n`;
+      helpText += `• Direct HTTP/HLS, Playwright deep network sniffer, Streamlink, yt-dlp, FFmpeg HLS, Retry candidate\n`;
+      helpText += `• Enforced output max 720p (no upscaling)\n`;
+      helpText += `• Indonesian title translation with fallback\n`;
+      helpText += `• Frame capture thumbnail @ 25s\n`;
+      helpText += `• Temporary cleanup after upload\n\n`;
       helpText += `_Note: Send or forward any link in Saved Messages or Private Chat to download automatically._`;
       await message.reply({ message: helpText });
       return;
@@ -125,7 +124,6 @@ export class BotHandler {
       }
     }
 
-    // If an action URL is detected, trigger the download pipeline
     if (targetUrl) {
       await this.handleDownloadRequest(event, targetUrl);
     }
@@ -137,11 +135,11 @@ export class BotHandler {
 
     logger.info(`Incoming download request from chat for URL: ${targetUrl}`);
 
-    // Send the single progress message that will be continuously updated
+    // Send single progress message that will be continuously edited
     let progressMsg: any;
     try {
       progressMsg = await originalMsg.reply({
-        message: `⏳ **Queued**\nURL: \`${targetUrl.slice(0, 50)}...\``,
+        message: `🔎 Detecting URL\n${targetUrl.slice(0, 50)}...`,
       });
     } catch (err: any) {
       logger.error('Failed to send initial progress message:', err);
@@ -158,8 +156,7 @@ export class BotHandler {
           messageId: progressMsg.id,
         },
         async (statusText, percent) => {
-          let formattedText = `${statusText}\n\n`;
-          formattedText += `🔗 **Target:** \`${targetUrl.slice(0, 55)}...\`\n`;
+          let formattedText = `${statusText}\n`;
           if (percent !== undefined && percent > 0) {
             const barLength = 10;
             const filled = Math.min(barLength, Math.round((percent / 100) * barLength));
@@ -172,22 +169,48 @@ export class BotHandler {
 
       // Successfully processed video
       if (completedTask.outputPath && fs.existsSync(completedTask.outputPath)) {
-        await progressTracker.update('📤 **Uploading video to Telegram...** (Please wait)');
+        await progressTracker.update('📤 Uploading to Telegram...');
 
         const fileSize = completedTask.sizeBytes || fs.statSync(completedTask.outputPath).size;
         const durationSec = Math.round(completedTask.duration || 0);
         const width = completedTask.width || 1280;
         const height = completedTask.height || 720;
+        const meta = completedTask.metadata || {};
 
-        // Build caption
-        let caption = `🎬 **Video Downloaded Successfully**\n\n`;
-        caption += `📦 **Size:** \`${formatBytes(fileSize)}\`\n`;
-        if (durationSec > 0) {
-          caption += `⏱️ **Duration:** \`${formatDuration(durationSec)}\`\n`;
+        // Domain extraction for caption
+        let domain = meta.domain;
+        if (!domain) {
+          try {
+            domain = new URL(targetUrl).hostname.replace(/^www\./, '');
+          } catch {
+            domain = 'web';
+          }
         }
-        caption += `📐 **Resolution:** \`${width}x${height}\`\n`;
-        caption += `⚡ **Engine:** \`${completedTask.activeEngine || 'HLS Fallback'}\`\n`;
-        caption += `🔗 **Source:** \`${targetUrl.slice(0, 60)}...\``;
+
+        // Title selection: translated title in Indonesian prioritized
+        const mainTitle = meta.translatedTitle || meta.originalTitle || 'Video';
+        const origTitle = meta.originalTitle && meta.originalTitle !== mainTitle ? meta.originalTitle : undefined;
+
+        // Construct caption adhering strictly to format
+        let caption = `🎬 ${mainTitle}\n\n`;
+        if (origTitle) {
+          caption += `🌐 Original: ${origTitle}\n`;
+        }
+        if (domain) {
+          caption += `🔗 Source: ${domain}\n`;
+        }
+        if (durationSec > 0) {
+          caption += `⏱ Duration: ${formatDuration(durationSec)}\n`;
+        }
+        // Resolution is strictly the ACTUAL final resolution after downscale/processing
+        caption += `📐 Resolution: ${width}x${height}\n`;
+        if (meta.codec) {
+          caption += `🎞 Video: ${meta.codec}\n`;
+        }
+        if (meta.audioCodec) {
+          caption += `🎵 Audio: ${meta.audioCodec}\n`;
+        }
+        caption += `📦 Size: ${formatBytes(fileSize)}`;
 
         // Construct video document attribute for streaming support
         const videoAttr = new Api.DocumentAttributeVideo({
@@ -201,25 +224,24 @@ export class BotHandler {
         await this.client.sendFile(chatId, {
           file: completedTask.outputPath,
           caption,
-          thumb: completedTask.thumbnailPath && fs.existsSync(completedTask.thumbnailPath)
-            ? completedTask.thumbnailPath
-            : undefined,
+          thumb:
+            completedTask.thumbnailPath && fs.existsSync(completedTask.thumbnailPath)
+              ? completedTask.thumbnailPath
+              : undefined,
           attributes: [videoAttr],
           replyTo: originalMsg.id,
           progressCallback: async (progress: number) => {
             const percent = Math.round(progress * 100);
             if (percent % 25 === 0) {
-              await progressTracker.update(`📤 **Uploading to Telegram:** ${percent}%`);
+              await progressTracker.update(`📤 Uploading: ${percent}%`);
             }
           },
         });
 
-        // Mark single progress message as Done
-        await progressTracker.markDone(
-          `✅ **Done!** Video uploaded.\nSize: \`${formatBytes(fileSize)}\` | Engine: \`${completedTask.activeEngine}\``
-        );
+        // Mark single progress message as Completed
+        await progressTracker.markDone('✅ Completed');
 
-        // Clean up output file after successful upload
+        // Clean up output video and thumbnail from disk
         try {
           fs.unlinkSync(completedTask.outputPath);
           if (completedTask.thumbnailPath && fs.existsSync(completedTask.thumbnailPath)) {
@@ -232,13 +254,7 @@ export class BotHandler {
     } catch (err: any) {
       const errorMsg = err?.message || String(err);
       logger.error(`Download job failed for ${targetUrl}:`, errorMsg);
-
-      let failText = `❌ **Download Failed**\n\n`;
-      failText += `🔗 **URL:** \`${targetUrl.slice(0, 60)}...\`\n`;
-      failText += `⚠️ **Error Summary:**\n\`${errorMsg.slice(0, 450)}\`\n\n`;
-      failText += `_All fallback download engines were attempted before concluding failure._`;
-
-      await progressTracker.markFailed(failText);
+      await progressTracker.markFailed(errorMsg.slice(0, 300));
     }
   }
 }

@@ -8,6 +8,7 @@ import { DownloadTask, EngineResult } from '../types.ts';
 import { analyzeUrl } from '../utils/url-extractor.ts';
 import { remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
 import { formatBytes } from '../utils/system.ts';
+import { extractHtmlMetadata } from '../utils/metadata.ts';
 import { logger } from '../logger.ts';
 
 export class DirectEngine extends BaseEngine {
@@ -15,7 +16,7 @@ export class DirectEngine extends BaseEngine {
   readonly priority = 1;
 
   async isAvailable(): Promise<boolean> {
-    return true; // Always available via native fetch and cheerio
+    return true; // Native fetch and cheerio
   }
 
   async download(
@@ -24,6 +25,7 @@ export class DirectEngine extends BaseEngine {
   ): Promise<EngineResult> {
     const targetUrl = task.streamUrl || task.originalUrl;
     const urlInfo = analyzeUrl(targetUrl);
+    const downloadDir = task.subDirs?.download || task.tempDir;
 
     try {
       // 1. Direct HLS (.m3u8) check
@@ -34,14 +36,15 @@ export class DirectEngine extends BaseEngine {
           success: false,
           engineName: this.name,
           error: 'Direct M3U8 detected, transferring to FFmpeg/HLS engine for segment assembly',
+          errorType: 'NO_M3U8_FOUND',
         };
       }
 
       // 2. Direct Video File (.mp4, .mkv, .webm, etc.) check
       if (urlInfo.isDirectVideo) {
         onProgress?.('⬇️ Direct video stream detected, downloading...', 20);
-        const rawFile = path.join(task.tempDir, `raw_direct_${Date.now()}.bin`);
-        const finalMp4 = path.join(task.tempDir, `direct_output_${Date.now()}.mp4`);
+        const rawFile = path.join(downloadDir, `raw_direct_${Date.now()}.bin`);
+        const finalMp4 = path.join(downloadDir, `direct_output_${Date.now()}.mp4`);
 
         await this.downloadDirectStream(targetUrl, rawFile, onProgress, task.abortController.signal);
 
@@ -59,14 +62,27 @@ export class DirectEngine extends BaseEngine {
 
       // 3. Web Page Inspection via Cheerio
       onProgress?.('🌐 Inspecting page HTML for media & HLS playlists...', 10);
-      const res = await fetch(targetUrl, {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,video/*,*/*;q=0.8',
-        },
-        signal: task.abortController.signal,
-      });
+      
+      const timeoutController = new AbortController();
+      const fetchTimer = setTimeout(() => timeoutController.abort(), 15000);
+
+      const abortHandler = () => timeoutController.abort();
+      task.abortController.signal.addEventListener('abort', abortHandler, { once: true });
+
+      let res: globalThis.Response;
+      try {
+        res = await fetch(targetUrl, {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,video/*,*/*;q=0.8',
+          },
+          signal: timeoutController.signal,
+        });
+      } finally {
+        clearTimeout(fetchTimer);
+        task.abortController.signal.removeEventListener('abort', abortHandler);
+      }
 
       const contentType = res.headers.get('content-type') || '';
       if (
@@ -79,13 +95,14 @@ export class DirectEngine extends BaseEngine {
           success: false,
           engineName: this.name,
           error: 'Content-type indicates HLS stream, passing to FFmpeg HLS engine',
+          errorType: 'NO_M3U8_FOUND',
         };
       }
 
       if (contentType.includes('video/')) {
         onProgress?.('⬇️ Video response detected from URL...', 25);
-        const rawFile = path.join(task.tempDir, `raw_stream_${Date.now()}.bin`);
-        const finalMp4 = path.join(task.tempDir, `stream_output_${Date.now()}.mp4`);
+        const rawFile = path.join(downloadDir, `raw_stream_${Date.now()}.bin`);
+        const finalMp4 = path.join(downloadDir, `stream_output_${Date.now()}.mp4`);
 
         if (!res.body) {
           throw new Error('Response body was empty');
@@ -104,6 +121,12 @@ export class DirectEngine extends BaseEngine {
 
       // Parse HTML
       const html = await res.text();
+
+      // Extract metadata if not already extracted
+      if (!task.metadata || !task.metadata.originalTitle) {
+        task.metadata = await extractHtmlMetadata(html, targetUrl);
+      }
+
       const $ = cheerio.load(html);
 
       // Look for video or source tags
@@ -111,8 +134,10 @@ export class DirectEngine extends BaseEngine {
       $('video, source').each((_, el) => {
         const src = $(el).attr('src');
         if (src && (src.includes('.m3u8') || src.includes('.mp4') || src.includes('.webm'))) {
-          detectedMediaUrl = new URL(src, targetUrl).href;
-          return false;
+          try {
+            detectedMediaUrl = new URL(src, targetUrl).href;
+            return false;
+          } catch {}
         }
       });
 
@@ -131,7 +156,8 @@ export class DirectEngine extends BaseEngine {
         return {
           success: false,
           engineName: this.name,
-          error: `Extracted media URL (${detectedMediaUrl.slice(0, 60)}...), proceeding to downloader engine`,
+          error: `Extracted media URL (${detectedMediaUrl.slice(0, 60)}...), proceeding to downstream engines`,
+          errorType: 'NO_M3U8_FOUND',
         };
       }
 
@@ -139,12 +165,15 @@ export class DirectEngine extends BaseEngine {
         success: false,
         engineName: this.name,
         error: 'No direct video stream or static M3U8 found in HTML tags',
+        errorType: 'NO_MEDIA_FOUND',
       };
     } catch (err: any) {
+      const isTimeout = err.name === 'AbortError' || String(err).includes('abort');
       return {
         success: false,
         engineName: this.name,
         error: err.message || 'Direct inspection failed',
+        errorType: isTimeout ? 'TIMEOUT' : 'NETWORK_ERROR',
       };
     }
   }

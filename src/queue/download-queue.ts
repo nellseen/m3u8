@@ -4,8 +4,9 @@ import crypto from 'crypto';
 import { DownloadTask, DownloadStatus } from '../types.ts';
 import { config } from '../config.ts';
 import { FallbackOrchestrator } from '../engines/orchestrator.ts';
-import { cleanupTaskTemp, killTaskProcesses, ensureDirectories } from '../utils/cleaner.ts';
-import { probeMedia, generateThumbnail } from '../utils/ffmpeg.ts';
+import { createTaskDirectories, cleanupTaskTemp, killTaskProcesses, ensureDirectories } from '../utils/cleaner.ts';
+import { enforceMax720p, generateThumbnailAt25s, probeMedia } from '../utils/ffmpeg.ts';
+import { getAvailableDiskSpace } from '../utils/system.ts';
 import { logger } from '../logger.ts';
 
 type JobCallback = (task: DownloadTask) => void;
@@ -17,6 +18,8 @@ interface QueuedJob {
   onComplete: JobCallback;
   onError: (task: DownloadTask, error: Error) => void;
 }
+
+const MIN_FREE_DISK_BYTES = 250 * 1024 * 1024; // 250 MB minimum free storage
 
 export class DownloadQueue {
   private activeJobs: Map<string, DownloadTask> = new Map();
@@ -38,8 +41,7 @@ export class DownloadQueue {
   ): Promise<DownloadTask> {
     return new Promise((resolve, reject) => {
       const taskId = `job_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-      const jobTempDir = path.join(config.tempDir, taskId);
-      fs.mkdirSync(jobTempDir, { recursive: true });
+      const { tempDir, subDirs } = createTaskDirectories(config.tempDir, taskId);
 
       const task: DownloadTask = {
         id: taskId,
@@ -48,7 +50,8 @@ export class DownloadQueue {
         messageId: options.messageId,
         status: 'queued',
         failedEngines: [],
-        tempDir: jobTempDir,
+        tempDir,
+        subDirs,
         startTime: Date.now(),
         abortController: new AbortController(),
         subprocesses: [],
@@ -62,14 +65,13 @@ export class DownloadQueue {
       };
 
       this.pendingQueue.push(queuedJob);
-      logger.info(`Enqueued task ${task.id}. Pending queue size: ${this.pendingQueue.length}`);
+      logger.info(`Enqueued task ${task.id}. Pending queue length: ${this.pendingQueue.length}`);
 
       this.processNext();
     });
   }
 
   cancel(taskId: string): boolean {
-    // Check active
     const active = this.activeJobs.get(taskId);
     if (active) {
       logger.info(`Cancelling active task ${taskId}`);
@@ -82,7 +84,6 @@ export class DownloadQueue {
       return true;
     }
 
-    // Check pending
     const idx = this.pendingQueue.findIndex(j => j.task.id === taskId);
     if (idx !== -1) {
       const [removed] = this.pendingQueue.splice(idx, 1);
@@ -115,20 +116,35 @@ export class DownloadQueue {
     const { task, onProgress, onComplete, onError } = nextJob;
     this.activeJobs.set(task.id, task);
 
-    // Start timeout watcher
+    // 1. Storage Protection: Check available disk space before downloading
+    const availableSpace = getAvailableDiskSpace(config.tempDir);
+    if (availableSpace < MIN_FREE_DISK_BYTES) {
+      const errMsg = `Insufficient storage: only ${(availableSpace / (1024 * 1024)).toFixed(1)} MB free (minimum 250 MB required)`;
+      logger.taskError(task.id, 'Queue', 'STORAGE_CHECK', 'STORAGE_ERROR', errMsg);
+      task.status = 'failed';
+      task.errorCategory = 'STORAGE_ERROR';
+      this.activeJobs.delete(task.id);
+      await cleanupTaskTemp(task);
+      onError(task, new Error(errMsg));
+      this.processNext();
+      return;
+    }
+
+    // Start job timeout watcher
     const timeoutMs = config.downloadTimeoutSeconds * 1000;
     const timeoutTimer = setTimeout(() => {
       if (this.activeJobs.has(task.id)) {
         logger.warn(`Task ${task.id} timed out after ${config.downloadTimeoutSeconds}s. Aborting.`);
         task.status = 'failed';
+        task.errorCategory = 'TIMEOUT';
         task.abortController.abort();
         killTaskProcesses(task);
       }
     }, timeoutMs);
 
     try {
-      task.status = 'detecting';
-      onProgress?.('🔎 Detecting media source...', 5);
+      task.status = 'detecting_url';
+      onProgress?.('🔎 Detecting URL & media streams...', 5);
 
       const result = await this.orchestrator.executeWithFallback(task, (text, percent) => {
         task.statusMessage = text;
@@ -142,26 +158,53 @@ export class DownloadQueue {
 
       if (result.success && result.outputPath && fs.existsSync(result.outputPath)) {
         task.status = 'processing';
-        onProgress?.('⚙️ Extracting video metadata & generating preview...', 95);
+        onProgress?.('⚙️ Processing & enforcing resolution policy (max 720p)...', 80);
 
-        // Probe media info
-        const meta = await probeMedia(result.outputPath);
-        task.duration = meta.duration;
-        task.width = meta.width;
-        task.height = meta.height;
-        task.sizeBytes = meta.sizeBytes;
+        // 2. Enforce Max 720p (Aspect-ratio safe downscaling, NO upscaling if <= 720p)
+        const processedFile = path.join(task.subDirs?.processed || task.tempDir, `processed_${task.id}.mp4`);
+        const { outputPath: compliantVideoPath, meta: finalMeta } = await enforceMax720p(
+          result.outputPath,
+          processedFile,
+          (text, percent) => onProgress?.(text, percent)
+        );
 
-        // Move to permanent output directory to prevent temp cleanup collision
-        const finalFilename = `video_${task.id}.mp4`;
-        const permanentOutputPath = path.join(config.outputDir, finalFilename);
-        fs.copyFileSync(result.outputPath, permanentOutputPath);
-        task.outputPath = permanentOutputPath;
+        // Copy final compliant file to permanent output directory for Telegram upload
+        const permanentVideoPath = path.join(config.outputDir, `video_${task.id}.mp4`);
+        fs.copyFileSync(compliantVideoPath, permanentVideoPath);
+        task.outputPath = permanentVideoPath;
 
-        // Thumbnail
-        const thumbPath = path.join(task.tempDir, `thumb_${task.id}.jpg`);
-        const hasThumb = await generateThumbnail(permanentOutputPath, thumbPath);
-        if (hasThumb) {
-          task.thumbnailPath = thumbPath;
+        // Populate task media details
+        task.duration = finalMeta.duration;
+        task.width = finalMeta.width;
+        task.height = finalMeta.height;
+        task.sizeBytes = finalMeta.sizeBytes;
+
+        if (!task.metadata) {
+          task.metadata = {};
+        }
+        task.metadata.duration = finalMeta.duration;
+        task.metadata.width = finalMeta.width;
+        task.metadata.height = finalMeta.height;
+        task.metadata.resolution = finalMeta.width && finalMeta.height ? `${finalMeta.width}x${finalMeta.height}` : undefined;
+        task.metadata.codec = finalMeta.videoCodec;
+        task.metadata.audioCodec = finalMeta.audioCodec;
+        task.metadata.fps = finalMeta.fps;
+        task.metadata.filesize = finalMeta.sizeBytes;
+
+        // 3. Generate thumbnail at 25th second (or safe fraction) with metadata fallback
+        task.status = 'generating_thumbnail';
+        onProgress?.('🖼️ Generating thumbnail at 25s...', 95);
+
+        const permanentThumbPath = path.join(config.outputDir, `thumb_${task.id}.jpg`);
+        const thumbnailOutput = await generateThumbnailAt25s(
+          permanentVideoPath,
+          permanentThumbPath,
+          finalMeta.duration,
+          task.metadata.thumbnail
+        );
+
+        if (thumbnailOutput && fs.existsSync(thumbnailOutput)) {
+          task.thumbnailPath = thumbnailOutput;
         }
 
         task.status = 'completed';
@@ -180,7 +223,7 @@ export class DownloadQueue {
       onError(task, err);
     } finally {
       this.activeJobs.delete(task.id);
-      // Clean up isolated temp directory
+      // Clean up isolated temporary directories
       await cleanupTaskTemp(task);
       // Trigger next job in queue
       this.processNext();

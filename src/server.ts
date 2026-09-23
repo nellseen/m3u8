@@ -66,7 +66,11 @@ app.get('/', async (_req: Request, res: Response) => {
     <html lang="en">
     <head>
       <meta charset="utf-8">
-      <title>Telegram HLS Downloader Userbot</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Telegram Video HLS Fallback Userbot</title>
+      <meta name="description" content="Telegram Userbot video downloader with multi-layer HLS/M3U8 fallback orchestrator and FFmpeg processing.">
+      <meta property="og:title" content="Telegram Video HLS Fallback Userbot">
+      <meta property="og:description" content="Telegram Userbot video downloader with multi-layer HLS/M3U8 fallback orchestrator and FFmpeg processing.">
       <style>
         body { font-family: monospace, system-ui; background: #0f172a; color: #f8fafc; padding: 2rem; max-width: 800px; margin: 0 auto; line-height: 1.5; }
         .card { background: #1e293b; padding: 1.25rem; border-radius: 8px; margin-bottom: 1.5rem; border: 1px solid #334155; }
@@ -120,6 +124,9 @@ app.get('/', async (_req: Request, res: Response) => {
 let serverInstance: any = null;
 
 export async function startServer(): Promise<void> {
+  if (serverInstance) {
+    return;
+  }
   const port = config.port || 3000;
   serverInstance = app.listen(port, '0.0.0.0', () => {
     logger.info(`🚀 Backend server listening on http://0.0.0.0:${port}`);

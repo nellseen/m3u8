@@ -35,6 +35,27 @@ export function getFfmpegPath(): string {
   return 'ffmpeg';
 }
 
+export function getFfprobePath(): string {
+  if (isCommandAvailable('ffprobe')) {
+    return 'ffprobe';
+  }
+  if (fs.existsSync('/usr/bin/ffprobe')) {
+    return '/usr/bin/ffprobe';
+  }
+  return 'ffprobe';
+}
+
+export function getAvailableDiskSpace(dirPath: string): number {
+  try {
+    const targetDir = fs.existsSync(dirPath) ? dirPath : '.';
+    const stat = fs.statfsSync(targetDir);
+    return Number(stat.bavail) * Number(stat.bsize);
+  } catch {
+    return Infinity; // Fallback if statfs is unavailable
+  }
+}
+
+
 export function getYtdlpPath(): string {
   if (config.customPaths.ytdlp && fs.existsSync(config.customPaths.ytdlp)) {
     return config.customPaths.ytdlp;
