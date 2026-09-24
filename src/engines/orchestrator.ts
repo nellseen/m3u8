@@ -141,7 +141,7 @@ export class FallbackOrchestrator {
 
       task.activeEngine = engine.name;
       onProgressUpdate?.(`⚙️ Trying ${engine.name}...`);
-      logger.info(`Executing [${engine.name}] for task ${task.id}`);
+      logger.job(`[JOB] Executing [${engine.name}] for task ${task.id}`);
 
       const engineStart = Date.now();
       try {
@@ -161,7 +161,7 @@ export class FallbackOrchestrator {
               onProgressUpdate?.(`⚠️ ${engine.name} output missing audio track. Trying next engine for audio...`);
               // Let loop continue to next engine to recover audio
             } else {
-              logger.info(`✅ Success with [${engine.name}] in ${(durationMs / 1000).toFixed(1)}s (hasVideo=${mediaCheck.meta.hasVideo}, hasAudio=${mediaCheck.meta.hasAudio})`);
+              logger.job(`[JOB] Success with [${engine.name}] in ${(durationMs / 1000).toFixed(1)}s (hasVideo=${mediaCheck.meta.hasVideo}, hasAudio=${mediaCheck.meta.hasAudio})`);
               return result;
             }
           }

@@ -167,6 +167,7 @@ export interface DownloadTask {
   retryCount?: number;
   lastRetryReason?: string;
   workspace?: string;
+  fingerprint?: string;
   channelMessageId?: number;
   channelPeerId?: string;
   channelPostUrl?: string;
@@ -196,6 +197,32 @@ export interface PlaywrightHealthResult {
   stderr?: string;
   executablePath?: string;
   isSingleProcess?: boolean;
+}
+
+export type LogCategory =
+  | 'JOB'
+  | 'DISCOVERY'
+  | 'M3U8'
+  | 'HLS'
+  | 'PLAYWRIGHT'
+  | 'FFMPEG'
+  | 'YTDLP'
+  | 'STREAMLINK'
+  | 'TELEGRAM'
+  | 'QUEUE'
+  | 'CLEANUP'
+  | 'ERROR';
+
+export interface TelegramUploadResult {
+  jobId: string;
+  telegramChatId: string | number;
+  telegramMessageId: number;
+  fileName: string;
+  fileSize: number;
+  title: string;
+  sourceUrl: string;
+  engine: string;
+  timestamp: number;
 }
 
 export interface ResolvedChromium {

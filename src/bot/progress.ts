@@ -2,29 +2,111 @@ import { TelegramClient } from 'telegram';
 import { logger } from '../logger.ts';
 
 export type ProgressStage =
-  | 'detecting_url'
-  | 'extracting_metadata'
+  | 'detecting_source'
   | 'finding_media'
+  | 'm3u8_detected'
+  | 'resolving_stream'
   | 'downloading'
   | 'processing'
-  | 'limiting_resolution'
-  | 'generating_thumbnail'
-  | 'uploading'
+  | 'preparing_thumbnail'
+  | 'uploading_to_channel'
   | 'completed'
   | 'failed';
 
-const STAGE_LABELS: Record<ProgressStage, string> = {
-  detecting_url: '🔎 Detecting URL',
-  extracting_metadata: '🌐 Extracting metadata',
-  finding_media: '🧭 Finding media',
+export const USER_PROGRESS_LABELS: Record<ProgressStage, string> = {
+  detecting_source: '🔎 Detecting source...',
+  finding_media: '🌐 Finding media...',
+  m3u8_detected: '🎬 M3U8 detected',
+  resolving_stream: '📡 Resolving stream...',
   downloading: '⬇️ Downloading',
-  processing: '⚙️ Processing',
-  limiting_resolution: '📐 Limiting to 720p',
-  generating_thumbnail: '🖼️ Generating thumbnail',
-  uploading: '📤 Uploading',
+  processing: '⚙️ Processing...',
+  preparing_thumbnail: '🖼️ Preparing thumbnail...',
+  uploading_to_channel: '📤 Uploading to channel...',
   completed: '✅ Completed',
   failed: '❌ Download failed',
 };
+
+/**
+ * Builds standard 10-character progress bar: e.g. ████████░░ 80%
+ */
+export function formatProgressBar(percent: number): string {
+  const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+  const barLength = 10;
+  const filled = Math.min(barLength, Math.round((clamped / 100) * barLength));
+  const empty = barLength - filled;
+  return `${'█'.repeat(filled)}${'░'.repeat(empty)} ${clamped}%`;
+}
+
+/**
+ * Sanitizes an error message so it does not contain raw stack traces, file paths, or internal code lines
+ */
+export function sanitizeUserReason(reason: string): string {
+  if (!reason) return 'Unknown error occurred';
+
+  let clean = reason;
+
+  // Remove stack traces (e.g. "at Object.<anonymous> (/path/file.ts:12:34)")
+  clean = clean.split(/\n\s*at\s+/)[0];
+
+  // Remove raw file paths like /usr/..., /tmp/..., /home/...
+  clean = clean.replace(/(\/[a-zA-Z0-9_\-\.]+)+/g, match => {
+    // Keep brief filename if relevant, but strip full absolute directory paths
+    const parts = match.split('/');
+    return parts[parts.length - 1] || '[path]';
+  });
+
+  // Strip leading Error: prefixes
+  clean = clean.replace(/^([A-Za-z_]+Error:\s*)+/i, '');
+
+  return clean.trim() || 'Download process encountered an error';
+}
+
+/**
+ * Formats user-facing failure message strictly per user specification:
+ * ❌ Download failed
+ *
+ * Reason:
+ * {actual reason}
+ *
+ * Engine:
+ * {engine}
+ *
+ * Attempts:
+ * {x}
+ */
+export function formatUserErrorMessage(params: {
+  reason: string;
+  engine?: string;
+  attempts?: number;
+  rawError?: any;
+  taskId?: string;
+}): string {
+  if (params.rawError) {
+    logger.error(`[ERROR] Task ${params.taskId || 'unknown'} failure: ${params.rawError?.message || params.rawError}`);
+    if (params.rawError?.stack) {
+      logger.debug(`[ERROR] Internal stack trace: ${params.rawError.stack}`);
+    }
+  }
+
+  const cleanReason = sanitizeUserReason(params.reason);
+  const engineStr = params.engine || 'Direct / Fallback';
+  const attemptsCount = params.attempts && params.attempts > 0 ? params.attempts : 1;
+
+  return [
+    '❌ Download failed',
+    '',
+    'Reason:',
+    cleanReason,
+    '',
+    'Engine:',
+    engineStr,
+    '',
+    'Attempts:',
+    String(attemptsCount),
+  ].join('\n');
+}
+
+export const formatErrorForUser = formatUserErrorMessage;
 
 export class ProgressTracker {
   private client: TelegramClient;
@@ -41,9 +123,24 @@ export class ProgressTracker {
     this.messageId = messageId;
   }
 
-  async setStage(stage: ProgressStage, detail?: string, force = false): Promise<void> {
-    const label = STAGE_LABELS[stage] || stage;
-    const text = detail ? `${label}\n${detail}` : label;
+  /**
+   * Sets progress stage per specification:
+   * 🔎 Detecting source...
+   * 🌐 Finding media...
+   * 🎬 M3U8 detected
+   * 📡 Resolving stream...
+   * ⬇️ Downloading\n████████░░ 80%
+   * ⚙️ Processing...
+   * 🖼️ Preparing thumbnail...
+   * 📤 Uploading to channel...
+   * ✅ Completed
+   */
+  async setStage(stage: ProgressStage, percent?: number, force = false): Promise<void> {
+    const label = USER_PROGRESS_LABELS[stage] || stage;
+    let text = label;
+    if (stage === 'downloading' && percent !== undefined && percent > 0) {
+      text = `${label}\n${formatProgressBar(percent)}`;
+    }
     await this.update(text, force);
   }
 
@@ -61,7 +158,7 @@ export class ProgressTracker {
       }
       await this.doEdit(text);
     } else {
-      // Schedule trailing update to prevent hitting Telegram flood limits
+      // Schedule trailing update to prevent hitting Telegram flood limits without spamming
       if (!this.pendingUpdateTimeout) {
         const delay = Math.max(200, 1500 - timeSinceLastEdit);
         this.pendingUpdateTimeout = setTimeout(async () => {
@@ -81,14 +178,39 @@ export class ProgressTracker {
     await this.doEdit(summaryText || '✅ Completed');
   }
 
-  async markFailed(errorText: string): Promise<void> {
+  /**
+   * Marks task failed with strict template without exposing full stack trace
+   */
+  async markFailedWithDetails(params: {
+    reason: string;
+    engine?: string;
+    attempts?: number;
+    rawError?: any;
+    taskId?: string;
+  }): Promise<void> {
     this.isFinished = true;
     if (this.pendingUpdateTimeout) {
       clearTimeout(this.pendingUpdateTimeout);
       this.pendingUpdateTimeout = null;
     }
-    const fullText = `❌ Download failed\n\n${errorText}`;
-    await this.doEdit(fullText);
+
+    // Log complete stack trace internally
+    if (params.rawError) {
+      const internalStack = params.rawError?.stack || String(params.rawError);
+      logger.error(`[ProgressTracker] Task ${params.taskId || 'unknown'} internal stack trace:`, internalStack);
+    }
+
+    const formattedUserMsg = formatUserErrorMessage({
+      reason: params.reason,
+      engine: params.engine,
+      attempts: params.attempts,
+    });
+
+    await this.doEdit(formattedUserMsg);
+  }
+
+  async markFailed(errorText: string): Promise<void> {
+    await this.markFailedWithDetails({ reason: errorText });
   }
 
   async delete(): Promise<void> {
@@ -121,3 +243,4 @@ export class ProgressTracker {
     }
   }
 }
+

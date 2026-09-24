@@ -36,6 +36,10 @@ import { config } from '../src/config.ts';
 import { DownloadTask } from '../src/types.ts';
 import { getTelegramPostUrl } from '../src/bot/handler.ts';
 import { DownloadQueue } from '../src/queue/download-queue.ts';
+import { createJobFingerprint, normalizeUrlForFingerprint, areJobsEquivalent } from '../src/utils/fingerprint.ts';
+import { formatErrorForUser, formatProgressBar } from '../src/bot/progress.ts';
+import { sanitizeLog } from '../src/logger.ts';
+import { TelegramUploadResult } from '../src/types.ts';
 
 async function runSelfAudit() {
   console.log('\n========================================================');
@@ -1030,6 +1034,113 @@ seg-002.mp4
   const permErrDecision = evaluateRetryPolicy(new Error('CHAT_WRITE_FORBIDDEN: User not allowed to post'), 0);
   assert(permErrDecision.shouldRetry === false, 'Fatal permissions (CHAT_WRITE_FORBIDDEN) immediately aborts');
   assert(permErrDecision.action === 'abort', 'Action is abort for permission failures');
+
+  // =========================================================================
+  // TEST 19: Duplicate Job Fingerprint & Deduplication Check
+  // =========================================================================
+  console.log('\n--- Test 19: Duplicate Job Fingerprinting & Deduplication ---');
+
+  const urlA = 'https://example.com/stream/master.m3u8?token=xyz123&utm_source=twitter&utm_medium=social';
+  const urlB = 'https://example.com/stream/master.m3u8?utm_medium=social&utm_source=twitter&token=xyz123';
+  const urlC = 'https://example.com/other/video.mp4';
+
+  const normA = normalizeUrlForFingerprint(urlA);
+  const normB = normalizeUrlForFingerprint(urlB);
+  assert(normA === normB, 'Tracking parameters (utm_*) are stripped for fingerprint consistency');
+
+  const fpA = createJobFingerprint(urlA);
+  const fpB = createJobFingerprint(urlB);
+  const fpC = createJobFingerprint(urlC);
+
+  assert(fpA === fpB, 'Fingerprints match for identical media URL regardless of param ordering');
+  assert(fpA !== fpC, 'Different media streams produce distinct fingerprints');
+  assert(areJobsEquivalent(urlA, urlB) === true, 'Jobs are equivalent for same media source');
+  assert(areJobsEquivalent(urlA, urlC) === false, 'Jobs are not equivalent for distinct media');
+
+  // Test Queue duplicate check
+  const auditStorageQueue = new DownloadQueue();
+  const queueDupFoundBefore = auditStorageQueue.findExistingJob('https://example.com/stream/active.m3u8');
+  assert(queueDupFoundBefore === undefined, 'No duplicate found when queue is clean');
+
+  // =========================================================================
+  // TEST 20: Persisted Telegram Upload Result Storage
+  // =========================================================================
+  console.log('\n--- Test 20: Persisted Telegram Upload Result Storage ---');
+
+  const sampleResult: TelegramUploadResult = {
+    jobId: 'job_test_result_123',
+    telegramChatId: '-1001234567890',
+    telegramMessageId: 78910,
+    fileName: 'video_job_test_result_123.mp4',
+    fileSize: 4567890,
+    title: 'Uji Coba Video Stream',
+    sourceUrl: 'https://example.com/stream/video.m3u8',
+    engine: 'FFmpeg HLS Direct (Engine 5)',
+    timestamp: Date.now(),
+  };
+
+  auditStorageQueue.recordUploadResult(sampleResult);
+  const persistedResults = auditStorageQueue.getUploadResults();
+  const foundResult = persistedResults.find(r => r.jobId === 'job_test_result_123');
+
+  assert(Boolean(foundResult), 'Upload result successfully recorded in queue storage');
+  assert(foundResult?.telegramChatId === '-1001234567890', 'Result contains telegramChatId');
+  assert(foundResult?.telegramMessageId === 78910, 'Result contains telegramMessageId');
+  assert(foundResult?.fileName === 'video_job_test_result_123.mp4', 'Result contains fileName');
+  assert(foundResult?.fileSize === 4567890, 'Result contains fileSize');
+  assert(foundResult?.title === 'Uji Coba Video Stream', 'Result contains title');
+  assert(foundResult?.sourceUrl === 'https://example.com/stream/video.m3u8', 'Result contains sourceUrl');
+  assert(foundResult?.engine === 'FFmpeg HLS Direct (Engine 5)', 'Result contains engine');
+  assert(typeof foundResult?.timestamp === 'number', 'Result contains valid timestamp');
+
+  // =========================================================================
+  // TEST 21: User Progress & Error Formatting (No Stack Trace to User)
+  // =========================================================================
+  console.log('\n--- Test 21: User Progress & Error Formatting ---');
+
+  const bar80 = formatProgressBar(80);
+  assert(bar80 === '████████░░ 80%', 'Progress bar 80% formats strictly to 10 characters');
+
+  const bar0 = formatProgressBar(0);
+  assert(bar0 === '░░░░░░░░░░ 0%', 'Progress bar 0% formats strictly to 10 empty blocks');
+
+  const bar100 = formatProgressBar(100);
+  assert(bar100 === '██████████ 100%', 'Progress bar 100% formats strictly to 10 filled blocks');
+
+  // Error template format
+  const rawStackTrace = 'Error: Manifest 403 Forbidden\n    at Object.download (/src/engine.ts:120:15)\n    at processTicksAndRejections';
+  const formattedError = formatErrorForUser({
+    reason: 'Server mengembalikan status 403 Forbidden',
+    engine: 'FFmpeg HLS Direct (Engine 5)',
+    attempts: 3,
+    rawError: rawStackTrace,
+  });
+
+  assert(formattedError.includes('❌ Download failed'), 'Error starts with ❌ Download failed');
+  assert(formattedError.includes('Reason:\nServer mengembalikan status 403 Forbidden'), 'Error contains Reason block');
+  assert(formattedError.includes('Engine:\nFFmpeg HLS Direct (Engine 5)'), 'Error contains Engine block');
+  assert(formattedError.includes('Attempts:\n3'), 'Error contains Attempts block');
+  assert(!formattedError.includes('at Object.download'), 'Error NEVER includes stack trace to user');
+  assert(!formattedError.includes('processTicksAndRejections'), 'Internal node traces are hidden from user');
+
+  // =========================================================================
+  // TEST 22: Redacted Logging Categories & Sensitive Data Sanitization
+  // =========================================================================
+  console.log('\n--- Test 22: Redacted Logging & Category Sanity ---');
+
+  const sensitiveHeaders = 'Authorization: Bearer my_ultra_secret_jwt_token_12345';
+  const sanitizedHeaders = sanitizeLog(sensitiveHeaders);
+  assert(!sanitizedHeaders.includes('my_ultra_secret_jwt_token_12345'), 'Sanitizes Authorization Bearer tokens');
+  assert(sanitizedHeaders.includes('[REDACTED]'), 'Replaces Bearer token with [REDACTED]');
+
+  const sensitiveCookie = 'Cookie: session=secret_session_abcde; token=super_token_987';
+  const sanitizedCookie = sanitizeLog(sensitiveCookie);
+  assert(!sanitizedCookie.includes('secret_session_abcde'), 'Sanitizes session cookies');
+  assert(!sanitizedCookie.includes('super_token_987'), 'Sanitizes token cookies');
+
+  const sensitiveTelegramToken = 'Connecting with bot_token: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz';
+  const sanitizedBotToken = sanitizeLog(sensitiveTelegramToken);
+  assert(!sanitizedBotToken.includes('123456789:ABCdefGHIjklMNOpqrsTUVwxyz'), 'Sanitizes Telegram Bot Tokens');
 
   // SUMMARY
   console.log('\n========================================================');

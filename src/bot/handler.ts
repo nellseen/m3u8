@@ -1,6 +1,7 @@
 import { TelegramClient, Api } from 'telegram';
 import { NewMessage, NewMessageEvent } from 'telegram/events/index.js';
 import fs from 'fs';
+import path from 'path';
 import { config, saveTargetChannel } from '../config.ts';
 import { DownloadQueue } from '../queue/download-queue.ts';
 import { ProgressTracker } from './progress.ts';
@@ -8,7 +9,7 @@ import { extractUrlsFromText } from '../utils/url-extractor.ts';
 import { formatBytes, formatDuration } from '../utils/system.ts';
 import { logger } from '../logger.ts';
 import { getCurrentUser } from './client.ts';
-import { DownloadTask } from '../types.ts';
+import { DownloadTask, TelegramUploadResult } from '../types.ts';
 import { parseFloodWaitSeconds, calculateBackoffWithJitter } from '../utils/retry-handler.ts';
 
 /**
@@ -285,6 +286,7 @@ export class BotHandler {
         }
 
         let sentMessage: any;
+        logger.telegram(`[TELEGRAM] Uploading to target channel ${targetChannelStr}`);
         try {
           sentMessage = await this.client.sendFile(targetPeer, {
             file: task.outputPath!,
@@ -326,6 +328,7 @@ export class BotHandler {
           throw new Error('Telegram tidak mengembalikan message ID yang valid.');
         }
 
+        logger.telegram(`[TELEGRAM] Upload successful messageId=${sentMessage.id}`);
         return sentMessage as Api.Message;
       } catch (err: any) {
         lastError = err;
@@ -417,13 +420,19 @@ export class BotHandler {
     const isSelf = originalMsg.out || (me && originalMsg.senderId?.toString() === me.id?.toString());
     const isPrivate = originalMsg.isPrivate;
 
-    logger.info(`Incoming download request from chat for URL: ${targetUrl}`);
+    logger.job(`[JOB] Incoming download request for URL: ${targetUrl}`);
+
+    // Duplicate check notification
+    const existingTask = this.queue.findExistingJob(targetUrl);
+    if (existingTask) {
+      logger.job(`[JOB] Duplicate download request for URL ${targetUrl}. Reusing active job ${existingTask.id} (Status: ${existingTask.status})`);
+    }
 
     // Send single progress message that will be continuously edited
     let progressMsg: any;
     try {
       progressMsg = await originalMsg.reply({
-        message: `🔎 Mendeteksi URL & Analisis Sumber\n${targetUrl.slice(0, 50)}...`,
+        message: '🔎 Detecting source...',
       });
     } catch (err: any) {
       logger.error('Failed to send initial progress message:', err);
@@ -441,12 +450,12 @@ export class BotHandler {
           messageId: progressMsg.id,
         },
         async (statusText, percent) => {
-          let formattedText = `${statusText}\n`;
-          if (percent !== undefined && percent > 0) {
+          let formattedText = statusText;
+          if (percent !== undefined && percent > 0 && statusText.toLowerCase().includes('download')) {
             const barLength = 10;
             const filled = Math.min(barLength, Math.round((percent / 100) * barLength));
             const empty = barLength - filled;
-            formattedText += `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${percent}%\n`;
+            formattedText = `⬇️ Downloading\n${'█'.repeat(filled)}${'░'.repeat(empty)} ${percent}%`;
           }
           await progressTracker.update(formattedText);
         }
@@ -545,18 +554,21 @@ export class BotHandler {
         completedTask.endTime = Date.now();
         logger.taskError(completedTask.id, 'BotHandler', 'CHANNEL_UPLOAD', 'TELEGRAM_UPLOAD_ERROR', uploadError.message);
 
-        await progressTracker.markFailed(
-          `❌ **Upload ke Channel Gagal**: File video berhasil diunduh namun gagal dikirim ke TARGET_CHANNEL_ID (\`${targetChannelStr}\`).\n\n` +
-          `Sesuai aturan sistem: *Downloaded file ≠ Success*.\n\n` +
-          `Detail: ${uploadError.message}`
-        );
+        await progressTracker.markFailedWithDetails({
+          reason: `Upload ke Channel Gagal: ${uploadError.message}`,
+          engine: 'Telegram Upload',
+          attempts: 3,
+          rawError: uploadError,
+          taskId: completedTask.id,
+        });
 
         this.cleanupTaskFiles(completedTask);
         return;
       }
 
       // ─────────────────────────────────────────────────────────────
-      // SIMPAN TELEGRAM MESSAGE ID
+      // SIMPAN RESULT TELEGRAM
+      // jobId, telegramChatId, telegramMessageId, fileName, fileSize, title, sourceUrl, engine, timestamp
       // ─────────────────────────────────────────────────────────────
       const channelMessageId = sentChannelMsg.id;
       completedTask.channelMessageId = channelMessageId;
@@ -567,14 +579,27 @@ export class BotHandler {
       // Mark task as completed now that channel upload succeeded
       completedTask.status = 'completed';
       completedTask.endTime = Date.now();
+
+      const uploadResult: TelegramUploadResult = {
+        jobId: completedTask.id,
+        telegramChatId: targetChannelStr,
+        telegramMessageId: channelMessageId,
+        fileName: path.basename(completedTask.outputPath),
+        fileSize,
+        title: mainTitle,
+        sourceUrl: targetUrl,
+        engine: completedTask.activeEngine || 'Direct / Fallback',
+        timestamp: Date.now(),
+      };
+      this.queue.recordUploadResult(uploadResult);
       this.queue.recordCompletedJob(completedTask);
 
-      logger.info(`[Channel Upload SUCCESS] Task ${completedTask.id} -> Target: ${targetChannelStr} -> Telegram Message ID: #${channelMessageId}`);
+      logger.telegram(`[TELEGRAM] Upload successful messageId=${channelMessageId} for job ${completedTask.id}`);
 
       // ─────────────────────────────────────────────────────────────
       // KIRIM STATUS BERHASIL KE USER
       // ─────────────────────────────────────────────────────────────
-      let userStatusText = `✅ **Video Berhasil Dipublikasikan ke Channel!**\n\n`;
+      let userStatusText = `✅ **Completed**\n\n`;
       userStatusText += `📢 **Target Channel**: \`${targetChannelStr}\`\n`;
       userStatusText += `🆔 **Telegram Message ID**: \`#${channelMessageId}\`\n`;
       if (postUrl) {
@@ -620,16 +645,22 @@ export class BotHandler {
       const errorMsg = err?.message || String(err);
       logger.error(`Download job failed for ${targetUrl}:`, errorMsg);
 
-      let userFacingError = errorMsg;
+      let actualReason = errorMsg;
       if (errorMsg.includes('DRM Protection') || errorMsg.includes('DRM')) {
-        userFacingError = `🔒 **Konten Dilindungi DRM (Digital Rights Management)**\n\n${errorMsg}\n\n_Sesuai kebijakan: DRM memerlukan lisensi proprietary yang tidak tersedia dan tidak dapat dibypass._`;
+        actualReason = 'Konten dilindungi DRM (Digital Rights Management) dan tidak dapat didownload';
       } else if (errorMsg.includes('SAMPLE-AES')) {
-        userFacingError = `🔒 **Enkripsi SAMPLE-AES Terdeteksi**\n\n${errorMsg}\n\n_Format enkripsi sample-level ini memerlukan dekripsi CDM berlisensi yang tidak didukung._`;
+        actualReason = 'Enkripsi SAMPLE-AES memerlukan dekripsi CDM berlisensi yang tidak didukung';
       } else if (errorMsg.includes('Expired') || errorMsg.includes('expired') || errorMsg.includes('Forbidden/Unauthorized')) {
-        userFacingError = `⏱️ **Tautan / Token Segment Kadaluarsa**\n\n${errorMsg}\n\n_Silakan kirimkan tautan baru dari browser Anda._`;
+        actualReason = 'Tautan atau token manifest telah kadaluarsa. Silakan kirimkan tautan baru';
       }
 
-      await progressTracker.markFailed(userFacingError.slice(0, 400));
+      await progressTracker.markFailedWithDetails({
+        reason: actualReason,
+        engine: 'Direct / Fallback',
+        attempts: 3,
+        rawError: err,
+        taskId: targetUrl,
+      });
     }
   }
 }

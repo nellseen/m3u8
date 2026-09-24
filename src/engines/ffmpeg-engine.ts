@@ -156,19 +156,29 @@ export class FfmpegEngine extends BaseEngine {
       const manifestText = await this.fetchManifestContent(rawTargetUrl, task.streamHeaders, task.cookies);
 
       if (manifestText && manifestText.includes('#EXT-X-STREAM-INF')) {
+        logger.m3u8('[M3U8] Master playlist detected');
         const parsed = parseMasterPlaylist(manifestText, rawTargetUrl);
+        logger.m3u8(`[M3U8] ${parsed.variants.length} variants discovered`);
+
         if (parsed.isMaster && parsed.selectedVariant) {
           const sel = parsed.selectedVariant;
           effectiveVideoUrl = sel.uri;
           separateAudioTrackUrl = sel.audioTrackUri;
 
-          logger.info(
-            `[FFmpeg] Master Playlist parsed: selected variant ${sel.resolution || 'unknown'} (${sel.bandwidth || 0} bps), height=${sel.height || 'auto'}. Target <= 720p enforced.`
-          );
-          if (separateAudioTrackUrl) {
-            logger.info(`[FFmpeg] Master Playlist contains separated audio group track: ${separateAudioTrackUrl}`);
+          logger.hls(`[HLS] Selected ${sel.resolution || (sel.height ? sel.height + 'p' : '720p')} variant`);
+          if (parsed.audioGroups.length > 0 || separateAudioTrackUrl) {
+            logger.hls('[HLS] Audio group detected');
           }
         }
+      }
+
+      // Log required headers for HLS
+      const neededHeaders: string[] = [];
+      if (task.streamHeaders?.['Referer'] || task.streamHeaders?.['referer']) neededHeaders.push('Referer');
+      if (task.streamHeaders?.['Origin'] || task.streamHeaders?.['origin']) neededHeaders.push('Origin');
+      if (task.cookies || task.streamHeaders?.['Cookie'] || task.streamHeaders?.['cookie']) neededHeaders.push('Cookie');
+      if (neededHeaders.length > 0) {
+        logger.hls(`[HLS] Required headers: ${neededHeaders.join(', ')}`);
       }
     }
 
@@ -242,6 +252,7 @@ export class FfmpegEngine extends BaseEngine {
     audioUrl?: string,
     onProgress?: (statusText: string, percent?: number) => void
   ): Promise<EngineResult> {
+    logger.ffmpeg('[FFMPEG] Starting download');
     return new Promise(resolve => {
       let stderr = '';
       const args: string[] = ['-y'];

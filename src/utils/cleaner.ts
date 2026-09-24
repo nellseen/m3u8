@@ -125,7 +125,7 @@ export async function cleanupTaskTemp(task: DownloadTask): Promise<void> {
     if (task.tempDir && fs.existsSync(task.tempDir)) {
       if (task.tempDir.includes(task.id)) {
         fs.rmSync(task.tempDir, { recursive: true, force: true });
-        logger.debug(`Cleaned up isolated temp directory for task ${task.id}: ${task.tempDir}`);
+        logger.cleanup(`[CLEANUP] Cleaned up isolated workspace directory for task ${task.id}: ${task.tempDir}`);
       }
     }
   } catch (err) {
