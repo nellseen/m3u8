@@ -11,6 +11,10 @@ import { killTaskProcesses } from '../utils/cleaner.ts';
 import { validateMediaFile } from '../utils/ffmpeg.ts';
 import { logger } from '../logger.ts';
 import { evaluateRetryPolicy, executeTaskRetryAction } from '../utils/retry-handler.ts';
+import { isM3u8Url } from '../utils/url-extractor.ts';
+import { isUrlExpired } from '../utils/signed-url.ts';
+import { detectHlsEncryption, parseHlsManifest } from '../utils/m3u8-parser.ts';
+import { planEngineRoute, EngineRegistry, RouteDecision } from '../utils/source-router.ts';
 
 function classifyError(errStr: string, explicitType?: ErrorCategory, hasStreamUrl = false): ErrorCategory {
   if (explicitType) {
@@ -92,30 +96,161 @@ function classifyError(errStr: string, explicitType?: ErrorCategory, hasStreamUr
 
 export class FallbackOrchestrator {
   private engines: BaseEngine[] = [];
+  private engineRegistry: EngineRegistry;
 
   constructor() {
-    // Registered in prioritized fallback order (Engine 1 to Engine 6)
-    this.engines = [
-      new DirectEngine(),       // Engine 1: Direct HTTP / HLS Detection
-      new PlaywrightEngine(),   // Engine 2: Playwright + Chromium Network Discovery
-      new StreamlinkEngine(),   // Engine 3: Streamlink
-      new YtdlpEngine(),        // Engine 4: yt-dlp
-      new FfmpegEngine(),       // Engine 5: FFmpeg Direct HLS Processing
-      new RetryEngine(),        // Engine 6: Secondary Discovered Media Retry
-    ];
+    const direct = new DirectEngine();
+    const playwright = new PlaywrightEngine();
+    const streamlink = new StreamlinkEngine();
+    const ytdlp = new YtdlpEngine();
+    const ffmpeg = new FfmpegEngine();
+    const retry = new RetryEngine();
+
+    this.engineRegistry = {
+      direct,
+      playwright,
+      streamlink,
+      ytdlp,
+      ffmpeg,
+      retry,
+    };
+
+    // Registered all 6 engines for inventory queries
+    this.engines = [direct, playwright, streamlink, ytdlp, ffmpeg, retry];
   }
 
   getEngines(): BaseEngine[] {
     return [...this.engines];
   }
 
+  getRegistry(): EngineRegistry {
+    return this.engineRegistry;
+  }
+
+  /**
+   * Pre-inspects direct M3U8 manifests before launching heavy engines.
+   * Checks encryption (DRM / SAMPLE-AES), verifies expiration, and inspects variants.
+   */
+  private async preInspectDirectM3u8(
+    task: DownloadTask,
+    targetUrl: string,
+    onProgressUpdate?: (text: string, percent?: number) => void
+  ): Promise<EngineResult | null> {
+    if (isUrlExpired(targetUrl)) {
+      logger.warn(`[Orchestrator] Direct M3U8 URL signature is expired: ${targetUrl}`);
+      task.status = 'failed';
+      task.errorCategory = 'EXPIRED_URL';
+      return {
+        success: false,
+        engineName: 'M3U8 Parser',
+        error: 'Signed stream URL timestamp has expired. Re-discovery required.',
+        errorType: 'EXPIRED_URL',
+        details: { isExpiredUrl: true },
+      };
+    }
+
+    onProgressUpdate?.('🔎 M3U8 Parser: Menganalisis manifest, enkripsi, dan varian...', 15);
+
+    try {
+      let content: string | null = null;
+
+      if (fs.existsSync(targetUrl)) {
+        content = fs.readFileSync(targetUrl, 'utf8');
+      } else if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
+        const res = await fetch(targetUrl, {
+          headers: {
+            'User-Agent':
+              task.streamHeaders?.['user-agent'] ||
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            Accept:
+              'application/vnd.apple.mpegurl,application/x-mpegURL,application/mpegurl,*/*;q=0.8',
+            Referer: task.streamHeaders?.['referer'] || targetUrl,
+          },
+          signal: AbortSignal.timeout(8000),
+        });
+        if (res.ok) {
+          content = await res.text();
+        }
+      }
+
+      if (content) {
+        const encryption = detectHlsEncryption(content);
+        task.encryption = encryption;
+
+        if (encryption.isDrm) {
+          logger.warn(`[Orchestrator] DRM protected stream detected by M3U8 Parser: ${encryption.reason}`);
+          task.status = 'failed';
+          task.errorCategory = 'DRM_PROTECTED';
+          return {
+            success: false,
+            engineName: 'M3U8 Parser',
+            error: encryption.reason || 'DRM protection detected. Cannot be bypassed.',
+            errorType: 'DRM_PROTECTED',
+            details: { isDrm: true, encryption },
+          };
+        }
+
+        if (encryption.primaryMethod === 'SAMPLE-AES') {
+          logger.warn('[Orchestrator] SAMPLE-AES encrypted stream detected by M3U8 Parser');
+          task.status = 'failed';
+          task.errorCategory = 'UNSUPPORTED_ENCRYPTION';
+          return {
+            success: false,
+            engineName: 'M3U8 Parser',
+            error: 'SAMPLE-AES encryption is not supported by standard pipelines.',
+            errorType: 'UNSUPPORTED_ENCRYPTION',
+            details: { encryption },
+          };
+        }
+
+        const parsed = parseHlsManifest(content, targetUrl);
+        if (parsed.type === 'MASTER') {
+          logger.info(`[Orchestrator] MASTER playlist parsed with ${parsed.variants.length} variants and ${parsed.audioGroups.length} audio groups.`);
+          if (parsed.selectedVariant) {
+            logger.info(`[Orchestrator] Selected variant: ${parsed.selectedVariant.resolution || 'optimal'} (${parsed.selectedVariant.uri})`);
+            task.streamUrl = parsed.selectedVariant.uri;
+            if (parsed.selectedVariant.audioTrackUri) {
+              logger.info(`[Orchestrator] Variant has separated audio track: ${parsed.selectedVariant.audioTrackUri}`);
+            }
+          }
+        } else if (parsed.type === 'MEDIA') {
+          logger.info(`[Orchestrator] MEDIA playlist parsed with ${parsed.segments.length} segments (total duration: ${parsed.totalDuration}s, isLive: ${parsed.isLive}).`);
+          task.streamUrl = targetUrl;
+        }
+      }
+    } catch (err: any) {
+      logger.debug(`[Orchestrator] Direct M3U8 parser pre-inspection exception: ${err.message}`);
+    }
+
+    return null;
+  }
+
   async executeWithFallback(
     task: DownloadTask,
     onProgressUpdate?: (text: string, percent?: number) => void
   ): Promise<EngineResult> {
-    logger.info(`Starting fallback download pipeline for task ${task.id} (${task.originalUrl})`);
+    logger.info(`Starting intelligent download pipeline for task ${task.id} (${task.originalUrl})`);
 
-    for (let i = 0; i < this.engines.length; i++) {
+    // 1. Direct M3U8 Fast-Path & Pre-Inspection
+    const initialTarget = task.streamUrl || task.originalUrl;
+    const isDirectManifest = isM3u8Url(initialTarget) || initialTarget.endsWith('.m3u8') || initialTarget.includes('.m3u8');
+
+    if (isDirectManifest) {
+      const preCheckResult = await this.preInspectDirectM3u8(task, initialTarget, onProgressUpdate);
+      if (preCheckResult) {
+        return preCheckResult;
+      }
+    }
+
+    // 2. Intelligent Engine Route Planning based on Source Characteristics
+    let routeDecision: RouteDecision = planEngineRoute(task, this.engineRegistry);
+    logger.info(`[Orchestrator] Intelligent Route Decision: ${routeDecision.category} -> ${routeDecision.reason}`);
+    onProgressUpdate?.(`🧭 Strategy: ${routeDecision.category}`);
+
+    let activePipeline: BaseEngine[] = [...routeDecision.recommendedEngines];
+    let manifestAlreadyDiscovered = Boolean(task.streamUrl);
+
+    for (let i = 0; i < activePipeline.length; i++) {
       if (task.abortController.signal.aborted) {
         return {
           success: false,
@@ -125,7 +260,7 @@ export class FallbackOrchestrator {
         };
       }
 
-      const engine = this.engines[i];
+      const engine = activePipeline[i];
       const isAvailable = await engine.isAvailable();
 
       if (!isAvailable) {
@@ -151,15 +286,28 @@ export class FallbackOrchestrator {
 
         const durationMs = Date.now() - engineStart;
 
+        // Check if an engine discovered a new manifest URL during page discovery
+        if (!manifestAlreadyDiscovered && task.streamUrl) {
+          manifestAlreadyDiscovered = true;
+          logger.info(`[Orchestrator] Manifest discovered (${task.streamUrl}). Re-planning route to bypass any remaining browser overhead.`);
+          // Switch to Direct M3U8 pipeline immediately
+          activePipeline = [
+            this.engineRegistry.ffmpeg,
+            this.engineRegistry.ytdlp,
+            this.engineRegistry.streamlink,
+            this.engineRegistry.retry,
+          ];
+          i = -1; // Next loop starts at index 0 of the new pipeline
+          continue;
+        }
+
         if (result.success && result.outputPath && fs.existsSync(result.outputPath)) {
-          // Double check audio + video stream integrity: do not accept video-only output if audio is expected
+          // Double check audio + video stream integrity
           const mediaCheck = await validateMediaFile(result.outputPath);
           if (mediaCheck.valid) {
-            // Check if audio is missing
-            if (mediaCheck.meta.hasVideo && !mediaCheck.meta.hasAudio && i < this.engines.length - 1) {
+            if (mediaCheck.meta.hasVideo && !mediaCheck.meta.hasAudio && i < activePipeline.length - 1) {
               logger.warn(`[Orchestrator] ${engine.name} produced output without audio track. Trying subsequent engines for complete audio+video...`);
               onProgressUpdate?.(`⚠️ ${engine.name} output missing audio track. Trying next engine for audio...`);
-              // Let loop continue to next engine to recover audio
             } else {
               logger.job(`[JOB] Success with [${engine.name}] in ${(durationMs / 1000).toFixed(1)}s (hasVideo=${mediaCheck.meta.hasVideo}, hasAudio=${mediaCheck.meta.hasAudio})`);
               return result;
@@ -167,7 +315,7 @@ export class FallbackOrchestrator {
           }
         }
 
-        // Failure on this engine -> Record, clean up, and continue to next engine
+        // Failure on this engine -> Record, clean up, and evaluate retry / fallback
         const reason = result.error || 'Engine returned failure without message';
         const hasStreamUrl = Boolean(task.streamUrl);
         const errorCategory = classifyError(reason, result.errorType, hasStreamUrl);
@@ -180,11 +328,9 @@ export class FallbackOrchestrator {
           durationMs,
         });
 
-        // Kill any subprocesses spawned by this engine
         killTaskProcesses(task);
 
-        // 1. Strict DRM & Unsupported Encryption Policy:
-        // Do not pretend success, do not attempt to bypass DRM. Report reason and halt immediately.
+        // Strict DRM & Unsupported Encryption Policy: halt immediately
         if (errorCategory === 'DRM_PROTECTED' || result.details?.isDrm) {
           logger.warn(`[Orchestrator] DRM protected media detected. Halting pipeline as DRM cannot be bypassed: ${reason}`);
           task.status = 'failed';
@@ -211,14 +357,7 @@ export class FallbackOrchestrator {
           };
         }
 
-        // 2. Error-Based Retry System:
-        // 403 -> refresh session/header -> rediscover -> retry
-        // 401 -> refresh authentication context -> rediscover -> retry
-        // 429 -> backoff -> retry
-        // 5xx -> exponential backoff -> retry
-        // timeout -> retry
-        // expired manifest -> rediscover -> retry
-        // Enforces MAX_RETRIES with exponential backoff + jitter (no infinite retries)
+        // Error-Based Retry Evaluation
         const retryDecision = evaluateRetryPolicy(reason, task.retryCount || 0, { maxRetries: 3 });
         if (retryDecision.shouldRetry) {
           task.retryCount = (task.retryCount || 0) + 1;
@@ -228,14 +367,12 @@ export class FallbackOrchestrator {
             logger.info(`[Orchestrator] Retry (${task.retryCount}/3) action '${retryDecision.action}': ${retryDecision.reason}`);
             onProgressUpdate?.(`🔄 ${retryDecision.reason}`);
             await executeTaskRetryAction(task, retryDecision);
-            // Restart orchestrator loop to re-discover source page and download immediately
             i = -1;
             continue;
           } else if (retryDecision.action === 'backoff' || retryDecision.action === 'retry_immediate') {
             logger.info(`[Orchestrator] Retry (${task.retryCount}/3) action '${retryDecision.action}': ${retryDecision.reason}`);
             onProgressUpdate?.(`⏳ ${retryDecision.reason}`);
             await executeTaskRetryAction(task, retryDecision);
-            // Retry engine if under retry budget
             if (task.retryCount <= 2) {
               i--;
               continue;
@@ -245,9 +382,8 @@ export class FallbackOrchestrator {
           logger.warn(`[Orchestrator] MAX_RETRIES reached (${task.retryCount}/3) for task ${task.id}. Proceeding with next fallback.`);
         }
 
-        // Notify progress editor about fallback
-        if (i < this.engines.length - 1) {
-          const nextEngine = this.engines[i + 1];
+        if (i < activePipeline.length - 1) {
+          const nextEngine = activePipeline[i + 1];
           onProgressUpdate?.(`⚠️ ${engine.name} failed. Falling back to ${nextEngine.name}...`);
         }
       } catch (err: any) {
@@ -266,7 +402,6 @@ export class FallbackOrchestrator {
 
         killTaskProcesses(task);
 
-        // Catch block error-based retry evaluation
         const catchDecision = evaluateRetryPolicy(errStr, task.retryCount || 0, { maxRetries: 3 });
         if (catchDecision.shouldRetry) {
           task.retryCount = (task.retryCount || 0) + 1;

@@ -3,7 +3,18 @@ import path from 'path';
 import { execSync } from 'child_process';
 import { extractUrlsFromText, analyzeUrl, isHlsContentType, isM3u8Url, normalizeMediaUrl } from '../src/utils/url-extractor.ts';
 import { scanHtmlForM3u8AndMedia } from '../src/utils/m3u8-detector.ts';
-import { parseMasterPlaylist, selectTargetVariant, detectHlsEncryption, parseHlsKeyTag, parseMediaPlaylist } from '../src/utils/m3u8-parser.ts';
+import {
+  parseMasterPlaylist,
+  selectTargetVariant,
+  detectHlsEncryption,
+  parseHlsKeyTag,
+  parseMediaPlaylist,
+  parseHlsManifest,
+  detectPlaylistType,
+  resolveHlsUri,
+  parseByteRange,
+} from '../src/utils/m3u8-parser.ts';
+import { categorizeSourceUrl, planEngineRoute } from '../src/utils/source-router.ts';
 import { validateSegmentBytes, validateHlsSegments } from '../src/utils/segment-validator.ts';
 import { isSignedUrl, parseUrlExpiration, isUrlExpired, shouldRefreshManifest, analyzeSignedUrl } from '../src/utils/signed-url.ts';
 import { normalizeCookies, mergeCookieStrings } from '../src/utils/cookie-manager.ts';
@@ -1141,6 +1152,226 @@ seg-002.mp4
   const sensitiveTelegramToken = 'Connecting with bot_token: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz';
   const sanitizedBotToken = sanitizeLog(sensitiveTelegramToken);
   assert(!sanitizedBotToken.includes('123456789:ABCdefGHIjklMNOpqrsTUVwxyz'), 'Sanitizes Telegram Bot Tokens');
+
+  // =========================================================================
+  // TEST 23: Enhanced M3U8 Parser & Playlist Hierarchy Discrimination
+  // =========================================================================
+  console.log('\n--- Test 23: Enhanced M3U8 Parser & Playlist Discrimination ---');
+
+  // 23.1 Playlist type detection: MASTER vs MEDIA
+  const masterContentSample = `
+#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-main",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="audio/en.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Indonesian",LANGUAGE="id",DEFAULT=NO,AUTOSELECT=YES,URI="subs/id.vtt"
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,AVERAGE-BANDWIDTH=2200000,RESOLUTION=1280x720,FRAME-RATE=30.000,CODECS="avc1.4d401f,mp4a.40.2",AUDIO="audio-main",SUBTITLES="subs"
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,FRAME-RATE=60.000,CODECS="avc1.640028,mp4a.40.2",AUDIO="audio-main"
+1080p/index.m3u8
+  `.trim();
+
+  const mediaContentSample = `
+#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:105
+#EXT-X-DISCONTINUITY-SEQUENCE:2
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-MAP:URI="init.mp4",BYTERANGE="720@0"
+#EXT-X-KEY:METHOD=AES-128,URI="https://keys.server.com/sec.key",IV=0x1234567890abcdef1234567890abcdef
+#EXT-X-PROGRAM-DATE-TIME:2026-09-24T08:00:00.000Z
+#EXT-X-DISCONTINUITY
+#EXTINF:6.000,segment 105
+#EXT-X-BYTERANGE:50000@720
+seg_105.m4s
+#EXTINF:4.500,segment 106
+seg_106.m4s
+#EXT-X-ENDLIST
+  `.trim();
+
+  const liveMediaSample = `
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:4
+#EXT-X-MEDIA-SEQUENCE:50
+#EXTINF:4.0,live 50
+live_50.ts
+#EXTINF:4.0,live 51
+live_51.ts
+  `.trim();
+
+  assert(detectPlaylistType(masterContentSample) === 'MASTER', 'Detects Master Playlist via #EXT-X-STREAM-INF and #EXT-X-MEDIA');
+  assert(detectPlaylistType(mediaContentSample) === 'MEDIA', 'Detects Media Playlist via #EXTINF and #EXT-X-TARGETDURATION');
+  assert(detectPlaylistType(liveMediaSample) === 'MEDIA', 'Detects Live Media Playlist via segments and #EXT-X-MEDIA-SEQUENCE');
+
+  // 23.2 Master Playlist Parsing: Renditions, Audio, Subtitles, Codecs
+  const parsedMasterFull = parseMasterPlaylist(masterContentSample, 'https://stream.cdn.com/live/master.m3u8?token=secureToken999');
+  assert(parsedMasterFull.isMaster === true, 'Master playlist has isMaster: true');
+  assert(parsedMasterFull.variants.length === 2, 'Parsed all variants');
+  assert(parsedMasterFull.audioGroups.length === 1, 'Parsed audio rendition group');
+  assert(parsedMasterFull.subtitleGroups.length === 1, 'Parsed subtitle rendition group');
+  assert(parsedMasterFull.subtitleGroups[0].language === 'id', 'Parsed subtitle language ID');
+  assert(parsedMasterFull.selectedVariant?.resolution === '1280x720', 'Target policy chooses 720p variant');
+  assert(Boolean(parsedMasterFull.selectedVariant?.audioTrackUri?.includes('audio/en.m3u8')), 'Variant associated with matching audio track URI');
+  assert(Boolean(parsedMasterFull.selectedVariant?.subtitleTrackUri?.includes('subs/id.vtt')), 'Variant associated with matching subtitle track URI');
+
+  // 23.3 Media Playlist Parsing: #EXT-X-MAP, #EXT-X-BYTERANGE, #EXT-X-KEY, #EXT-X-PROGRAM-DATE-TIME, VOD vs Live
+  const parsedMediaFull = parseMediaPlaylist(mediaContentSample, 'https://stream.cdn.com/live/720p/index.m3u8?token=secureToken999');
+  assert(parsedMediaFull.isMaster === false, 'Media playlist has isMaster: false');
+  assert(parsedMediaFull.type === 'MEDIA', 'Playlist classified as MEDIA type');
+  assert(parsedMediaFull.targetDuration === 6, 'Parsed #EXT-X-TARGETDURATION: 6');
+  assert(parsedMediaFull.mediaSequence === 105, 'Parsed #EXT-X-MEDIA-SEQUENCE: 105');
+  assert(parsedMediaFull.discontinuitySequence === 2, 'Parsed #EXT-X-DISCONTINUITY-SEQUENCE: 2');
+  assert(parsedMediaFull.playlistType === 'VOD', 'Parsed #EXT-X-PLAYLIST-TYPE: VOD');
+  assert(parsedMediaFull.hasEndlist === true, 'Parsed #EXT-X-ENDLIST: true');
+  assert(parsedMediaFull.isLive === false, 'VOD playlist recognized as isLive: false');
+
+  // Initialization Segment & ByteRange
+  assert(Boolean(parsedMediaFull.initSegment), 'Parsed initialization segment #EXT-X-MAP');
+  assert(parsedMediaFull.initSegment?.byteRange?.length === 720, 'Parsed init segment byteRange length (720)');
+  assert(parsedMediaFull.initSegment?.byteRange?.offset === 0, 'Parsed init segment byteRange offset (0)');
+
+  // Media Segments Details
+  assert(parsedMediaFull.segments.length === 2, 'Parsed 2 media segments');
+  const seg0 = parsedMediaFull.segments[0];
+  assert(seg0.sequenceNumber === 105, 'Segment 0 has sequence number 105');
+  assert(seg0.duration === 6.0, 'Segment 0 duration 6.0s');
+  assert(seg0.discontinuity === true, 'Segment 0 marked with #EXT-X-DISCONTINUITY');
+  assert(seg0.programDateTime === '2026-09-24T08:00:00.000Z', 'Segment 0 marked with #EXT-X-PROGRAM-DATE-TIME');
+  assert(seg0.byteRange?.length === 50000 && seg0.byteRange.offset === 720, 'Segment 0 byteRange parsed (50000@720)');
+  assert(seg0.key?.method === 'AES-128', 'Segment 0 active encryption key is AES-128');
+
+  // Live stream detection without #EXT-X-ENDLIST
+  const parsedLive = parseMediaPlaylist(liveMediaSample, 'https://live.cdn.com/stream.m3u8');
+  assert(parsedLive.hasEndlist === false, 'Live stream has no #EXT-X-ENDLIST');
+  assert(parsedLive.isLive === true, 'Identifies live stream (isLive: true) when #EXT-X-ENDLIST is absent');
+
+  // 23.4 Relative URI & Signed Parameter Preservation
+  const relativeBase = 'https://cdn.example.com/hls/master.m3u8?token=xyz123&exp=1890000000';
+  const resolvedSegment = resolveHlsUri('segments/seg01.ts', relativeBase);
+  assert(resolvedSegment.startsWith('https://cdn.example.com/hls/segments/seg01.ts'), 'Resolves relative segment path');
+  assert(resolvedSegment.includes('token=xyz123'), 'Preserves authentication token parameter on resolved segment');
+  assert(resolvedSegment.includes('exp=1890000000'), 'Preserves signed expiration parameter on resolved segment');
+
+  // Consecutive ByteRange Calculation without @
+  const byteRangeTest = parseByteRange('10000', 5000);
+  assert(byteRangeTest.byteRange.length === 10000, 'Parsed byte range length');
+  assert(byteRangeTest.byteRange.offset === 5000, 'Assigned consecutive offset 5000');
+  assert(byteRangeTest.nextOffset === 15000, 'Calculated next consecutive offset 15000');
+
+  // Universal parseHlsManifest
+  const universalMaster = parseHlsManifest(masterContentSample, 'https://cdn.com/master.m3u8');
+  assert(universalMaster.type === 'MASTER', 'Universal parser returns MASTER result');
+  const universalMedia = parseHlsManifest(mediaContentSample, 'https://cdn.com/media.m3u8');
+  assert(universalMedia.type === 'MEDIA', 'Universal parser returns MEDIA result');
+
+  // =========================================================================
+  // TEST 24: Intelligent Engine Routing (Zero-Overhead Strategy Selection)
+  // =========================================================================
+  console.log('\n--- Test 24: Intelligent Engine Routing Strategy ---');
+
+  // 24.1 Source URL Categorization
+  assert(categorizeSourceUrl('https://edge.cdn.com/live/stream.m3u8') === 'DIRECT_M3U8', 'Classify .m3u8 URL as DIRECT_M3U8');
+  assert(categorizeSourceUrl('https://edge.cdn.com/hls/manifest?format=m3u8') === 'DIRECT_M3U8', 'Classify query-based HLS as DIRECT_M3U8');
+  assert(categorizeSourceUrl('https://files.storage.com/video/sample.mp4') === 'DIRECT_VIDEO', 'Classify .mp4 URL as DIRECT_VIDEO');
+  assert(categorizeSourceUrl('https://www.youtube.com/watch?v=dQw4w9WgXcQ') === 'YTDLP_PREFERRED', 'Classify YouTube as YTDLP_PREFERRED');
+  assert(categorizeSourceUrl('https://x.com/OpenAI/status/1780000000') === 'YTDLP_PREFERRED', 'Classify X/Twitter as YTDLP_PREFERRED');
+  assert(categorizeSourceUrl('https://www.tiktok.com/@user/video/12345') === 'YTDLP_PREFERRED', 'Classify TikTok as YTDLP_PREFERRED');
+  assert(categorizeSourceUrl('https://www.twitch.tv/shroud') === 'STREAMLINK_PREFERRED', 'Classify Twitch as STREAMLINK_PREFERRED');
+  assert(categorizeSourceUrl('https://kick.com/xqc') === 'STREAMLINK_PREFERRED', 'Classify Kick as STREAMLINK_PREFERRED');
+  assert(categorizeSourceUrl('https://streaming-site.net/watch-movie/78910') === 'PAGE_DISCOVERY', 'Classify generic page as PAGE_DISCOVERY');
+
+  // 24.2 Engine Pipeline Planning
+  const routerOrchestrator = new FallbackOrchestrator();
+  const reg = routerOrchestrator.getRegistry();
+
+  // Test Direct M3U8 Routing: MUST skip Playwright
+  const directM3u8Task: DownloadTask = {
+    id: 'test-direct-m3u8',
+    chatId: 1001,
+    messageId: 201,
+    originalUrl: 'https://cdn.example.com/hls/master.m3u8',
+    status: 'queued',
+    failedEngines: [],
+    subprocesses: [],
+    abortController: new AbortController(),
+    tempDir: config.tempDir,
+    startTime: Date.now(),
+  };
+
+  const directPlan = planEngineRoute(directM3u8Task, reg);
+  assert(directPlan.category === 'DIRECT_M3U8', 'Route decision is DIRECT_M3U8');
+  assert(directPlan.skipPlaywright === true, 'DIRECT_M3U8 explicitly sets skipPlaywright: true');
+  assert(
+    directPlan.recommendedEngines[0].name.includes('FFmpeg'),
+    'Direct M3U8 prioritizes FFmpeg HLS engine first'
+  );
+  assert(
+    !directPlan.recommendedEngines.some(e => e.name.includes('Playwright')),
+    'Playwright is completely excluded from Direct M3U8 recommended engines to avoid overhead'
+  );
+
+  // Test yt-dlp Preferred Routing: Prioritizes yt-dlp
+  const ytdlpTask: DownloadTask = {
+    id: 'test-ytdlp',
+    chatId: 1001,
+    messageId: 202,
+    originalUrl: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+    status: 'queued',
+    failedEngines: [],
+    subprocesses: [],
+    abortController: new AbortController(),
+    tempDir: config.tempDir,
+    startTime: Date.now(),
+  };
+
+  const ytdlpPlan = planEngineRoute(ytdlpTask, reg);
+  assert(ytdlpPlan.category === 'YTDLP_PREFERRED', 'Route decision is YTDLP_PREFERRED');
+  assert(ytdlpPlan.recommendedEngines[0].name.includes('yt-dlp'), 'Prioritizes yt-dlp engine first');
+
+  // Test Streamlink Preferred Routing: Prioritizes Streamlink
+  const streamlinkTask: DownloadTask = {
+    id: 'test-streamlink',
+    chatId: 1001,
+    messageId: 203,
+    originalUrl: 'https://www.twitch.tv/esl_csgo',
+    status: 'queued',
+    failedEngines: [],
+    subprocesses: [],
+    abortController: new AbortController(),
+    tempDir: config.tempDir,
+    startTime: Date.now(),
+  };
+
+  const streamlinkPlan = planEngineRoute(streamlinkTask, reg);
+  assert(streamlinkPlan.category === 'STREAMLINK_PREFERRED', 'Route decision is STREAMLINK_PREFERRED');
+  assert(streamlinkPlan.recommendedEngines[0].name.includes('Streamlink'), 'Prioritizes Streamlink engine first');
+
+  // Test Page Discovery Routing: DirectEngine first, then Playwright for JS sites
+  const discoveryTask: DownloadTask = {
+    id: 'test-discovery',
+    chatId: 1001,
+    messageId: 204,
+    originalUrl: 'https://my-streaming-website.tv/player/12345',
+    status: 'queued',
+    failedEngines: [],
+    subprocesses: [],
+    abortController: new AbortController(),
+    tempDir: config.tempDir,
+    startTime: Date.now(),
+  };
+
+  const discoveryPlan = planEngineRoute(discoveryTask, reg);
+  assert(discoveryPlan.category === 'PAGE_DISCOVERY', 'Route decision is PAGE_DISCOVERY');
+  assert(discoveryPlan.recommendedEngines[0].name.includes('Direct'), 'Runs lightweight Direct inspection first');
+  assert(discoveryPlan.recommendedEngines[1].name.includes('Playwright'), 'Follows with Playwright for JS/SPA network interception');
+
+  // Test Dynamic Route Re-Planning: Once streamUrl is set, Playwright is bypassed
+  discoveryTask.streamUrl = 'https://discovered-cdn.org/stream.m3u8';
+  const replanned = planEngineRoute(discoveryTask, reg);
+  assert(replanned.category === 'DIRECT_M3U8', 'Re-plans to DIRECT_M3U8 once manifest is discovered');
+  assert(replanned.skipPlaywright === true, 'Bypasses Playwright once streamUrl is known');
+  assert(replanned.recommendedEngines[0].name.includes('FFmpeg'), 'Directs discovered stream straight to FFmpeg');
 
   // SUMMARY
   console.log('\n========================================================');
