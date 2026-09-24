@@ -10,6 +10,7 @@ import { DownloadTask, EngineResult, ErrorCategory } from '../types.ts';
 import { killTaskProcesses } from '../utils/cleaner.ts';
 import { validateMediaFile } from '../utils/ffmpeg.ts';
 import { logger } from '../logger.ts';
+import { evaluateRetryPolicy, executeTaskRetryAction } from '../utils/retry-handler.ts';
 
 function classifyError(errStr: string, explicitType?: ErrorCategory, hasStreamUrl = false): ErrorCategory {
   if (explicitType) {
@@ -210,32 +211,38 @@ export class FallbackOrchestrator {
           };
         }
 
-        // 2. Expired Signed URL Flow:
-        // discover -> download segera. Jika URL expired: re-discover source -> ambil manifest baru -> download ulang.
-        const isExpiredTrigger =
-          errorCategory === 'EXPIRED_URL' ||
-          Boolean(result.details?.isExpiredUrl) ||
-          reason.toLowerCase().includes('expired');
+        // 2. Error-Based Retry System:
+        // 403 -> refresh session/header -> rediscover -> retry
+        // 401 -> refresh authentication context -> rediscover -> retry
+        // 429 -> backoff -> retry
+        // 5xx -> exponential backoff -> retry
+        // timeout -> retry
+        // expired manifest -> rediscover -> retry
+        // Enforces MAX_RETRIES with exponential backoff + jitter (no infinite retries)
+        const retryDecision = evaluateRetryPolicy(reason, task.retryCount || 0, { maxRetries: 3 });
+        if (retryDecision.shouldRetry) {
+          task.retryCount = (task.retryCount || 0) + 1;
+          task.lastRetryReason = retryDecision.reason;
 
-        if (isExpiredTrigger && task.originalUrl && task.streamUrl && task.originalUrl !== task.streamUrl) {
-          const rediscoveryAttempts = task.rediscoveryCount || 0;
-          if (rediscoveryAttempts < 1) {
-            task.rediscoveryCount = rediscoveryAttempts + 1;
-            logger.info(
-              `[Orchestrator] Expired signed URL detected (${reason}). Re-discovering source page (${task.originalUrl}) to obtain fresh manifest...`
-            );
-            onProgressUpdate?.('🔄 URL/Manifest expired. Mengambil manifest baru dari sumber...');
-
-            // Clear stale expired manifest, streamUrl and candidates
-            task.streamUrl = undefined;
-            task.discoveredMedia = [];
-            task.discoveredAt = undefined;
-            task.encryption = undefined;
-
+          if (retryDecision.action === 'rediscover' || retryDecision.action === 'refresh_auth') {
+            logger.info(`[Orchestrator] Retry (${task.retryCount}/3) action '${retryDecision.action}': ${retryDecision.reason}`);
+            onProgressUpdate?.(`🔄 ${retryDecision.reason}`);
+            await executeTaskRetryAction(task, retryDecision);
             // Restart orchestrator loop to re-discover source page and download immediately
             i = -1;
             continue;
+          } else if (retryDecision.action === 'backoff' || retryDecision.action === 'retry_immediate') {
+            logger.info(`[Orchestrator] Retry (${task.retryCount}/3) action '${retryDecision.action}': ${retryDecision.reason}`);
+            onProgressUpdate?.(`⏳ ${retryDecision.reason}`);
+            await executeTaskRetryAction(task, retryDecision);
+            // Retry engine if under retry budget
+            if (task.retryCount <= 2) {
+              i--;
+              continue;
+            }
           }
+        } else if ((task.retryCount || 0) >= 3) {
+          logger.warn(`[Orchestrator] MAX_RETRIES reached (${task.retryCount}/3) for task ${task.id}. Proceeding with next fallback.`);
         }
 
         // Notify progress editor about fallback
@@ -258,6 +265,24 @@ export class FallbackOrchestrator {
         });
 
         killTaskProcesses(task);
+
+        // Catch block error-based retry evaluation
+        const catchDecision = evaluateRetryPolicy(errStr, task.retryCount || 0, { maxRetries: 3 });
+        if (catchDecision.shouldRetry) {
+          task.retryCount = (task.retryCount || 0) + 1;
+          task.lastRetryReason = catchDecision.reason;
+          logger.info(`[Orchestrator] Exception Retry (${task.retryCount}/3) action '${catchDecision.action}': ${catchDecision.reason}`);
+          onProgressUpdate?.(`🔄 ${catchDecision.reason}`);
+          await executeTaskRetryAction(task, catchDecision);
+
+          if (catchDecision.action === 'rediscover' || catchDecision.action === 'refresh_auth') {
+            i = -1;
+            continue;
+          } else if (task.retryCount <= 2) {
+            i--;
+            continue;
+          }
+        }
       }
     }
 

@@ -103,11 +103,16 @@ export interface ExtractedMetadata {
 }
 
 export interface TaskSubDirectories {
+  manifest: string;
+  cookies: string;
+  headers: string;
+  thumbnail: string;
+  partial: string;
+  final: string;
+  logs: string;
   source: string;
   download: string;
   processed: string;
-  thumbnail: string;
-  logs: string;
 }
 
 export interface EngineResult {
@@ -159,6 +164,9 @@ export interface DownloadTask {
   encryption?: HlsEncryptionAnalysis;
   discoveredAt?: number;
   rediscoveryCount?: number;
+  retryCount?: number;
+  lastRetryReason?: string;
+  workspace?: string;
   channelMessageId?: number;
   channelPeerId?: string;
   channelPostUrl?: string;

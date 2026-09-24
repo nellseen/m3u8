@@ -53,6 +53,7 @@ export class DownloadQueue {
         failedEngines: [],
         tempDir,
         subDirs,
+        workspace: tempDir,
         startTime: Date.now(),
         abortController: new AbortController(),
         subprocesses: [],
@@ -172,17 +173,22 @@ export class DownloadQueue {
         task.status = 'processing';
         onProgress?.('⚙️ Processing & enforcing resolution policy (max 720p)...', 80);
 
-        // 2. Enforce Max 720p (Aspect-ratio safe downscaling, NO upscaling if <= 720p)
+        // 2. Enforce Max 720p (Aspect-ratio safe downscaling, NO upscaling if <= 720p, copy/remux priority)
         const processedFile = path.join(task.subDirs?.processed || task.tempDir, `processed_${task.id}.mp4`);
-        const { outputPath: compliantVideoPath, meta: finalMeta } = await enforceMax720p(
+        const { outputPath: compliantVideoPath, meta: finalMeta, processingMode } = await enforceMax720p(
           result.outputPath,
           processedFile,
           (text, percent) => onProgress?.(text, percent)
         );
+        logger.info(`[Queue] Task ${task.id} processed via mode '${processingMode}' (Resolution: ${finalMeta.width}x${finalMeta.height})`);
+
+        // Store final compliant video inside task workspace dedicated 'final' directory
+        const workspaceFinalVideo = path.join(task.subDirs?.final || task.tempDir, `final_${task.id}.mp4`);
+        fs.copyFileSync(compliantVideoPath, workspaceFinalVideo);
 
         // Copy final compliant file to permanent output directory for Telegram upload
         const permanentVideoPath = path.join(config.outputDir, `video_${task.id}.mp4`);
-        fs.copyFileSync(compliantVideoPath, permanentVideoPath);
+        fs.copyFileSync(workspaceFinalVideo, permanentVideoPath);
         task.outputPath = permanentVideoPath;
 
         // Populate task media details
@@ -211,10 +217,11 @@ export class DownloadQueue {
         task.status = 'generating_thumbnail';
         onProgress?.('🖼️ Resolving thumbnail (Source/OG/Extractor/FFmpeg)...', 95);
 
+        const workspaceThumbPath = path.join(task.subDirs?.thumbnail || task.tempDir, `thumb_${task.id}.jpg`);
         const permanentThumbPath = path.join(config.outputDir, `thumb_${task.id}.jpg`);
         const thumbnailOutput = await resolveVideoThumbnail({
           videoPath: permanentVideoPath,
-          outputPath: permanentThumbPath,
+          outputPath: workspaceThumbPath,
           duration: finalMeta.duration,
           sourceThumbnail: task.metadata.sourceThumbnail,
           ogImage: task.metadata.ogImage,
@@ -222,7 +229,8 @@ export class DownloadQueue {
         });
 
         if (thumbnailOutput && fs.existsSync(thumbnailOutput)) {
-          task.thumbnailPath = thumbnailOutput;
+          fs.copyFileSync(thumbnailOutput, permanentThumbPath);
+          task.thumbnailPath = permanentThumbPath;
         }
 
         task.status = 'uploading';

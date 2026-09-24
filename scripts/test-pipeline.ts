@@ -15,8 +15,20 @@ import {
   enforceMax720p,
   resolveVideoThumbnail,
   remuxToTelegramMp4,
+  isCompatibleForCopy,
 } from '../src/utils/ffmpeg.ts';
-import { createTaskDirectories, cleanupTaskTemp } from '../src/utils/cleaner.ts';
+import {
+  createTaskDirectories,
+  cleanupTaskTemp,
+  writeTaskWorkspaceArtifact,
+  getTaskWorkspacePath,
+} from '../src/utils/cleaner.ts';
+import {
+  evaluateRetryPolicy,
+  calculateBackoffWithJitter,
+  parseFloodWaitSeconds,
+  extractHttpStatus,
+} from '../src/utils/retry-handler.ts';
 import { ensureIndonesianTitle, isLikelyIndonesian } from '../src/utils/translator.ts';
 import { extractHtmlMetadata } from '../src/utils/metadata.ts';
 import { getAvailableDiskSpace } from '../src/utils/system.ts';
@@ -773,6 +785,251 @@ seg-002.mp4
     shouldRefreshManifest(Date.now(), expiredTask.streamUrl) === true,
     'Expired stream URL triggers refresh policy before download'
   );
+
+  // =========================================================================
+  // TEST 15: Error-Based Retry System
+  // =========================================================================
+  console.log('\n--- Test 15: Error-Based Retry System ---');
+
+  // 15.1 Error 403 Forbidden: Refresh session/header -> Rediscover -> Retry
+  const err403Decision = evaluateRetryPolicy(new Error('HTTP 403 Forbidden: Access Denied'), 0, { maxRetries: 3 });
+  assert(err403Decision.shouldRetry === true, '403 triggers retry');
+  assert(err403Decision.action === 'rediscover', '403 triggers session refresh and source rediscovery');
+
+  // 15.2 Error 401 Unauthorized: Refresh authentication context -> Rediscover -> Retry
+  const err401Decision = evaluateRetryPolicy(new Error('HTTP 401 Unauthorized: Invalid Token'), 0, { maxRetries: 3 });
+  assert(err401Decision.shouldRetry === true, '401 triggers retry');
+  assert(err401Decision.action === 'refresh_auth', '401 triggers auth context refresh and rediscovery');
+
+  // 15.3 Error 429 Too Many Requests: Backoff -> Retry
+  const err429Decision = evaluateRetryPolicy(new Error('429 Too Many Requests: Rate limit exceeded'), 0, { maxRetries: 3 });
+  assert(err429Decision.shouldRetry === true, '429 triggers retry');
+  assert(err429Decision.action === 'backoff', '429 triggers backoff action');
+  assert(err429Decision.delayMs > 0, '429 applies backoff delay');
+
+  // 15.4 Error 5xx Server Errors: Exponential backoff -> Retry
+  const err500Decision = evaluateRetryPolicy(new Error('500 Internal Server Error'), 0, { maxRetries: 3 });
+  assert(err500Decision.shouldRetry === true, '500 triggers retry');
+  assert(err500Decision.action === 'backoff', '500 triggers exponential backoff');
+
+  const err502Decision = evaluateRetryPolicy(new Error('502 Bad Gateway'), 0, { maxRetries: 3 });
+  assert(err502Decision.shouldRetry === true, '502 triggers retry');
+
+  const err503Decision = evaluateRetryPolicy(new Error('503 Service Unavailable'), 0, { maxRetries: 3 });
+  assert(err503Decision.shouldRetry === true, '503 triggers retry');
+
+  // 15.5 Timeout: Retry
+  const errTimeoutDecision = evaluateRetryPolicy(new Error('ETIMEDOUT: Connection timed out'), 0, { maxRetries: 3 });
+  assert(errTimeoutDecision.shouldRetry === true, 'Timeout triggers retry');
+  assert(errTimeoutDecision.action === 'retry_immediate', 'Timeout triggers retry with backoff');
+
+  // 15.6 Expired Manifest: Rediscover -> Retry
+  const errExpiredDecision = evaluateRetryPolicy(new Error('Manifest token or session has expired'), 0, { maxRetries: 3 });
+  assert(errExpiredDecision.shouldRetry === true, 'Expired manifest triggers retry');
+  assert(errExpiredDecision.action === 'rediscover', 'Expired manifest triggers source rediscovery');
+
+  // 15.7 MAX_RETRIES Boundary Enforcement (No infinite retry)
+  const maxRetryDecision = evaluateRetryPolicy(new Error('500 Internal Server Error'), 3, { maxRetries: 3 });
+  assert(maxRetryDecision.shouldRetry === false, 'Stops retrying when MAX_RETRIES (3) reached');
+  assert(maxRetryDecision.action === 'abort', 'Action is abort when retries exhausted');
+
+  // 15.8 Exponential Backoff with Jitter Distribution
+  const b1 = calculateBackoffWithJitter(1, 1000, 30000);
+  const b2 = calculateBackoffWithJitter(2, 1000, 30000);
+  const b3 = calculateBackoffWithJitter(3, 1000, 30000);
+  assert(b1 >= 500 && b1 <= 1000, `Attempt 1 delay (${b1}ms) within expected 500-1000ms bounds`);
+  assert(b2 >= 1000 && b2 <= 2000, `Attempt 2 delay (${b2}ms) within expected 1000-2000ms bounds`);
+  assert(b3 >= 2000 && b3 <= 4000, `Attempt 3 delay (${b3}ms) within expected 2000-4000ms bounds`);
+
+  // 15.9 Strict No-Retry on DRM
+  const drmRetryDecision = evaluateRetryPolicy(new Error('Widevine DRM protected stream'), 0);
+  assert(drmRetryDecision.shouldRetry === false, 'Never retries DRM protected streams');
+
+  // =========================================================================
+  // TEST 16: Download Temp Directory & Isolated Workspace
+  // =========================================================================
+  console.log('\n--- Test 16: Download Temp Directory & Workspace Isolation ---');
+
+  const baseTestDir = path.join(config.tempDir, 'test_workspace_isolation');
+  const taskId1 = 'job_test_alpha';
+  const taskId2 = 'job_test_beta';
+
+  const ws1 = createTaskDirectories(baseTestDir, taskId1);
+  const ws2 = createTaskDirectories(baseTestDir, taskId2);
+
+  assert(ws1.tempDir !== ws2.tempDir, 'Each job has distinct, isolated temporary directory');
+  assert(ws1.tempDir.includes(taskId1), 'Task 1 directory includes its unique jobId');
+  assert(ws2.tempDir.includes(taskId2), 'Task 2 directory includes its unique jobId');
+
+  // Verify all required workspace subdirectories exist:
+  // manifest, cookies, headers, thumbnail, partial video, final video, logs
+  assert(fs.existsSync(ws1.subDirs.manifest), 'Dedicated manifest/ directory exists');
+  assert(fs.existsSync(ws1.subDirs.cookies), 'Dedicated cookies/ directory exists');
+  assert(fs.existsSync(ws1.subDirs.headers), 'Dedicated headers/ directory exists');
+  assert(fs.existsSync(ws1.subDirs.thumbnail), 'Dedicated thumbnail/ directory exists');
+  assert(fs.existsSync(ws1.subDirs.partial), 'Dedicated partial/ directory exists');
+  assert(fs.existsSync(ws1.subDirs.final), 'Dedicated final/ directory exists');
+  assert(fs.existsSync(ws1.subDirs.logs), 'Dedicated logs/ directory exists');
+
+  // Save artifacts inside task 1 workspace
+  const mockTask1: DownloadTask = {
+    id: taskId1,
+    chatId: 1001,
+    messageId: 201,
+    originalUrl: 'https://example.com/stream1',
+    status: 'processing',
+    tempDir: ws1.tempDir,
+    subDirs: ws1.subDirs,
+    workspace: ws1.tempDir,
+    startTime: Date.now(),
+    subprocesses: [],
+    failedEngines: [],
+    abortController: new AbortController(),
+  };
+
+  const manifestFile = writeTaskWorkspaceArtifact(mockTask1, 'manifest', 'playlist.m3u8', '#EXTM3U\n#EXT-X-VERSION:3');
+  const cookiesFile = writeTaskWorkspaceArtifact(mockTask1, 'cookies', 'cookies.txt', 'SESSION_ID=abc123xyz;');
+  const headersFile = writeTaskWorkspaceArtifact(mockTask1, 'headers', 'headers.json', JSON.stringify({ 'User-Agent': 'Bot' }));
+  const logFile = writeTaskWorkspaceArtifact(mockTask1, 'logs', 'job.log', 'Job execution started at ' + new Date().toISOString());
+
+  assert(fs.existsSync(manifestFile), 'Manifest file written inside job workspace');
+  assert(fs.existsSync(cookiesFile), 'Cookies file written inside job workspace');
+  assert(fs.existsSync(headersFile), 'Headers file written inside job workspace');
+  assert(fs.existsSync(logFile), 'Logs written inside job workspace');
+
+  // Ensure two jobs do not share the same temporary files
+  assert(!fs.existsSync(path.join(ws2.subDirs.manifest, 'playlist.m3u8')), 'Job 2 does not share Job 1 files');
+
+  // Cleanup on completion: both success and failure
+  await cleanupTaskTemp(mockTask1);
+  assert(!fs.existsSync(ws1.tempDir), 'Task workspace completely cleaned up on job completion');
+
+  const mockTask2: DownloadTask = {
+    id: taskId2,
+    chatId: 1002,
+    messageId: 202,
+    originalUrl: 'https://example.com/stream2',
+    status: 'failed',
+    tempDir: ws2.tempDir,
+    subDirs: ws2.subDirs,
+    workspace: ws2.tempDir,
+    startTime: Date.now(),
+    subprocesses: [],
+    failedEngines: [],
+    abortController: new AbortController(),
+  };
+
+  await cleanupTaskTemp(mockTask2);
+  assert(!fs.existsSync(ws2.tempDir), 'Failed task workspace also completely cleaned up (failure cleanup)');
+
+  // =========================================================================
+  // TEST 17: FFmpeg Processing Optimization (Copy/Remux Priority & Max 720p)
+  // =========================================================================
+  console.log('\n--- Test 17: FFmpeg Processing Optimization ---');
+
+  // 17.1 isCompatibleForCopy checks
+  assert(
+    isCompatibleForCopy({ hasVideo: true, height: 720, width: 1280, videoCodec: 'h264', audioCodec: 'aac' }) === true,
+    '720p H.264/AAC is compatible for copy/remux'
+  );
+  assert(
+    isCompatibleForCopy({ hasVideo: true, height: 480, width: 854, videoCodec: 'h264', audioCodec: 'aac' }) === true,
+    '480p H.264/AAC is compatible for copy/remux'
+  );
+  assert(
+    isCompatibleForCopy({ hasVideo: true, height: 360, width: 640, videoCodec: 'h264', audioCodec: 'aac' }) === true,
+    '360p H.264/AAC is compatible for copy/remux'
+  );
+  assert(
+    isCompatibleForCopy({ hasVideo: true, height: 1080, width: 1920, videoCodec: 'h264', audioCodec: 'aac' }) === false,
+    '1080p is not compatible for copy (must be downscaled to 720p)'
+  );
+  assert(
+    isCompatibleForCopy({ hasVideo: true, height: 720, width: 1280, videoCodec: 'mpeg2video', audioCodec: 'aac' }) === false,
+    'Incompatible video codec (mpeg2video) requires transcoding'
+  );
+
+  // 17.2 Resolution Policy:
+  // 360p -> tetap 360p
+  // 480p -> tetap 480p
+  // 720p -> tetap 720p
+  // 1080p -> turun ke 720p
+  const ffmpegTestDir = path.join(config.tempDir, 'ffmpeg_opt_test');
+  if (!fs.existsSync(ffmpegTestDir)) fs.mkdirSync(ffmpegTestDir, { recursive: true });
+
+  const ffmpegBin = execSync('which ffmpeg', { encoding: 'utf8' }).trim();
+
+  // A. Create test 360p video (640x360)
+  const vid360In = path.join(ffmpegTestDir, 'in_360p.mp4');
+  const vid360Out = path.join(ffmpegTestDir, 'out_360p.mp4');
+  execSync(`"${ffmpegBin}" -y -f lavfi -i testsrc=duration=1:size=640x360:rate=10 -f lavfi -i sine=frequency=1000:duration=1 -c:v libx264 -c:a aac "${vid360In}"`, { stdio: 'ignore' });
+
+  const res360 = await enforceMax720p(vid360In, vid360Out);
+  assert(res360.meta.height === 360, `360p maintains native resolution: height is ${res360.meta.height} (NO UPSCALE)`);
+  assert(res360.processingMode === 'copy_remux', '360p prioritized copy/remux without unnecessary transcoding');
+
+  // B. Create test 480p video (854x480)
+  const vid480In = path.join(ffmpegTestDir, 'in_480p.mp4');
+  const vid480Out = path.join(ffmpegTestDir, 'out_480p.mp4');
+  execSync(`"${ffmpegBin}" -y -f lavfi -i testsrc=duration=1:size=854x480:rate=10 -f lavfi -i sine=frequency=1000:duration=1 -c:v libx264 -c:a aac "${vid480In}"`, { stdio: 'ignore' });
+
+  const res480 = await enforceMax720p(vid480In, vid480Out);
+  assert(res480.meta.height === 480, `480p maintains native resolution: height is ${res480.meta.height} (NO UPSCALE)`);
+  assert(res480.processingMode === 'copy_remux', '480p prioritized copy/remux without unnecessary transcoding');
+
+  // C. Create test 720p video (1280x720)
+  const vid720In = path.join(ffmpegTestDir, 'in_720p.mp4');
+  const vid720Out = path.join(ffmpegTestDir, 'out_720p.mp4');
+  execSync(`"${ffmpegBin}" -y -f lavfi -i testsrc=duration=1:size=1280x720:rate=10 -f lavfi -i sine=frequency=1000:duration=1 -c:v libx264 -c:a aac "${vid720In}"`, { stdio: 'ignore' });
+
+  const res720 = await enforceMax720p(vid720In, vid720Out);
+  assert(res720.meta.height === 720, `720p maintains native resolution: height is ${res720.meta.height}`);
+  assert(res720.processingMode === 'copy_remux', '720p prioritized copy/remux without unnecessary transcoding');
+
+  // D. Create test 1080p video (1920x1080) -> must downscale to 720p
+  const vid1080In = path.join(ffmpegTestDir, 'in_1080p.mp4');
+  const vid1080Out = path.join(ffmpegTestDir, 'out_1080p.mp4');
+  execSync(`"${ffmpegBin}" -y -f lavfi -i testsrc=duration=1:size=1920x1080:rate=10 -f lavfi -i sine=frequency=1000:duration=1 -c:v libx264 -c:a aac "${vid1080In}"`, { stdio: 'ignore' });
+
+  const res1080 = await enforceMax720p(vid1080In, vid1080Out);
+  assert(res1080.meta.height === 720, `1080p downscaled to max 720p: height is ${res1080.meta.height}`);
+  assert(res1080.processingMode === 'transcode', '1080p transcoded for downscale');
+
+  // Clean test dir
+  try {
+    fs.rmSync(ffmpegTestDir, { recursive: true, force: true });
+  } catch {}
+
+  // =========================================================================
+  // TEST 18: Upload Retry & FloodWait Handling
+  // =========================================================================
+  console.log('\n--- Test 18: Upload Retry & FloodWait Handling ---');
+
+  // 18.1 FloodWait seconds extraction
+  assert(parseFloodWaitSeconds(new Error('FLOOD_WAIT_28')) === 28, 'Parses FLOOD_WAIT_28');
+  assert(parseFloodWaitSeconds(new Error('A wait of 45 seconds is required')) === 45, 'Parses wait of 45 seconds');
+  assert(parseFloodWaitSeconds({ seconds: 60 }) === 60, 'Parses GramJS seconds property');
+
+  // 18.2 FloodWait retry decision: does NOT spam retry, follows exact wait time
+  const floodDecision = evaluateRetryPolicy(new Error('FLOOD_WAIT_20'), 0);
+  assert(floodDecision.shouldRetry === true, 'FloodWait is eligible for retry after waiting');
+  assert(floodDecision.action === 'wait_flood', 'Action is wait_flood');
+  assert(floodDecision.delayMs === 21000, 'Waits exact duration (20s + 1s buffer) without spamming retry');
+
+  // 18.3 Network error retry
+  const netErrDecision = evaluateRetryPolicy(new Error('read ECONNRESET'), 0);
+  assert(netErrDecision.shouldRetry === true, 'Connection reset (ECONNRESET) triggers upload retry');
+
+  const timeoutErrDecision = evaluateRetryPolicy(new Error('Upload request timed out'), 0);
+  assert(timeoutErrDecision.shouldRetry === true, 'Timeout triggers upload retry');
+
+  const rpcErrDecision = evaluateRetryPolicy(new Error('RPC_CALL_FAIL 500: Temporary Telegram Error'), 0);
+  assert(rpcErrDecision.shouldRetry === true, 'Temporary Telegram RPC error triggers upload retry');
+
+  // 18.4 Non-retryable permission error
+  const permErrDecision = evaluateRetryPolicy(new Error('CHAT_WRITE_FORBIDDEN: User not allowed to post'), 0);
+  assert(permErrDecision.shouldRetry === false, 'Fatal permissions (CHAT_WRITE_FORBIDDEN) immediately aborts');
+  assert(permErrDecision.action === 'abort', 'Action is abort for permission failures');
 
   // SUMMARY
   console.log('\n========================================================');

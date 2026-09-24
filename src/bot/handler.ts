@@ -9,6 +9,7 @@ import { formatBytes, formatDuration } from '../utils/system.ts';
 import { logger } from '../logger.ts';
 import { getCurrentUser } from './client.ts';
 import { DownloadTask } from '../types.ts';
+import { parseFloodWaitSeconds, calculateBackoffWithJitter } from '../utils/retry-handler.ts';
 
 /**
  * Builds public or private channel post link
@@ -247,6 +248,11 @@ export class BotHandler {
   /**
    * Mandatory upload to TARGET_CHANNEL_ID with retry policy
    */
+  /**
+   * Uploads final compliant video to TARGET_CHANNEL_ID with robust retry:
+   * Handles: network errors, timeouts, FloodWait, connection reset (ECONNRESET), and temporary Telegram errors.
+   * For FloodWait: complies with Telegram's exact wait time without spamming retries.
+   */
   private async uploadToChannelWithRetry(
     targetPeer: any,
     targetChannelStr: string,
@@ -255,7 +261,7 @@ export class BotHandler {
     videoAttr: Api.DocumentAttributeVideo,
     progressTracker: ProgressTracker
   ): Promise<Api.Message> {
-    const MAX_RETRIES = 3;
+    const MAX_RETRIES = 5;
     let lastError: any = null;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -324,36 +330,65 @@ export class BotHandler {
       } catch (err: any) {
         lastError = err;
         const errMsg = err?.message || String(err);
+        const lowerErr = errMsg.toLowerCase();
         logger.warn(`[Upload] Attempt ${attempt}/${MAX_RETRIES} to channel ${targetChannelStr} failed: ${errMsg}`);
 
-        // Check for fatal permission errors
+        // 1. Check for fatal non-retryable permission errors
         if (
-          errMsg.includes('CHAT_ADMIN_REQUIRED') ||
-          errMsg.includes('CHAT_WRITE_FORBIDDEN') ||
-          errMsg.includes('CHANNEL_PRIVATE') ||
-          errMsg.includes('USER_BANNED_IN_CHANNEL')
+          lowerErr.includes('chat_admin_required') ||
+          lowerErr.includes('chat_write_forbidden') ||
+          lowerErr.includes('channel_private') ||
+          lowerErr.includes('user_banned_in_channel')
         ) {
           throw new Error(`Akses ditolak pada channel ${targetChannelStr}: ${errMsg}. Pastikan akun userbot sudah bergabung dan menjadi admin/memiliki izin kirim media.`);
         }
 
-        // Check for Telegram FLOOD_WAIT
-        const floodMatch = errMsg.match(/FLOOD_WAIT_(\d+)/i);
-        if (floodMatch) {
-          const waitSec = parseInt(floodMatch[1], 10);
-          if (waitSec <= 30 && attempt < MAX_RETRIES) {
-            logger.warn(`Flood wait ${waitSec}s encountered. Waiting before retry...`);
-            await progressTracker.update(`⏳ Flood wait Telegram ${waitSec}s... Menunggu giliran upload.`);
-            await new Promise(r => setTimeout(r, (waitSec + 1) * 1000));
+        // 2. Strict FloodWait Handling:
+        // Jangan spam retry! Ikuti waktu tunggu yang diberikan Telegram.
+        const floodWaitSec = parseFloodWaitSeconds(err);
+        if (floodWaitSec !== null) {
+          if (floodWaitSec <= 180 && attempt < MAX_RETRIES) {
+            logger.warn(`[Upload] Telegram FloodWait detected: ${floodWaitSec}s required. Waiting exact duration without spamming...`);
+            await progressTracker.update(`⏳ FloodWait Telegram terdeteksi (${floodWaitSec}s). Menunggu sesuai instruksi Telegram tanpa spam...`);
+            await new Promise(r => setTimeout(r, (floodWaitSec + 1) * 1000));
+            // Resume loop after waiting the exact required time
             continue;
           } else {
-            throw new Error(`Telegram FloodWait (${waitSec}s) melebihi batas toleransi retry.`);
+            throw new Error(`Telegram FloodWait (${floodWaitSec}s) melebihi batas waktu toleransi upload.`);
           }
         }
 
-        // Exponential backoff between retries
+        // 3. Retry on network error, timeout, connection reset, and temporary Telegram errors
+        const isNetworkOrTimeout =
+          lowerErr.includes('timeout') ||
+          lowerErr.includes('timed out') ||
+          lowerErr.includes('econnreset') ||
+          lowerErr.includes('econnrefused') ||
+          lowerErr.includes('socket hang up') ||
+          lowerErr.includes('connection reset') ||
+          lowerErr.includes('fetch failed') ||
+          lowerErr.includes('temporary') ||
+          lowerErr.includes('rpc_call_fail') ||
+          lowerErr.includes('msg_wait_failed') ||
+          lowerErr.includes('500') ||
+          lowerErr.includes('internal');
+
         if (attempt < MAX_RETRIES) {
-          const backoffMs = attempt * 2000;
-          await progressTracker.update(`⚠️ Percobaan ${attempt} gagal, mencoba ulang dalam ${backoffMs / 1000}s...`);
+          // Exponential backoff with jitter
+          const backoffMs = calculateBackoffWithJitter(attempt, 2000, 25000);
+          const backoffSec = (backoffMs / 1000).toFixed(1);
+
+          if (lowerErr.includes('timeout') || lowerErr.includes('timed out')) {
+            await progressTracker.update(`⏱️ [Timeout] Percobaan ${attempt}/${MAX_RETRIES} gagal timeout. Mencoba ulang dalam ${backoffSec}s...`);
+          } else if (lowerErr.includes('reset') || lowerErr.includes('econnreset')) {
+            await progressTracker.update(`🔌 [Connection Reset] Sambungan terputus. Mencoba ulang dalam ${backoffSec}s (Percobaan ${attempt}/${MAX_RETRIES})...`);
+          } else if (lowerErr.includes('temporary') || lowerErr.includes('500') || lowerErr.includes('rpc_call_fail')) {
+            await progressTracker.update(`⚠️ [Telegram Server Sementara] Menunggu ${backoffSec}s sebelum upload ulang (Percobaan ${attempt}/${MAX_RETRIES})...`);
+          } else {
+            await progressTracker.update(`⚠️ Percobaan ${attempt}/${MAX_RETRIES} gagal (${errMsg.slice(0, 35)}...), mencoba ulang dalam ${backoffSec}s...`);
+          }
+
+          logger.info(`[Upload] Backing off for ${backoffMs}ms before upload retry attempt ${attempt + 1}/${MAX_RETRIES}...`);
           await new Promise(r => setTimeout(r, backoffMs));
         }
       }

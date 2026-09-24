@@ -63,7 +63,7 @@ export const config: BotConfig = {
   sessionFilePath,
   maxConcurrentJobs: Math.max(1, getEnvNumber('MAX_CONCURRENT_JOBS', 2)),
   downloadTimeoutSeconds: Math.max(60, getEnvNumber('DOWNLOAD_TIMEOUT_SECONDS', 900)),
-  tempDir: path.resolve(getEnvString('TEMP_DIR', './temp')),
+  tempDir: path.resolve(getEnvString('TEMP_DIR', process.platform === 'win32' ? './temp' : '/tmp/downloader')),
   outputDir: path.resolve(getEnvString('OUTPUT_DIR', './output')),
   logDir: path.resolve(getEnvString('LOG_DIR', './logs')),
   port: getEnvNumber('PORT', 3000),
