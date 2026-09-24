@@ -3,7 +3,9 @@ import path from 'path';
 import { execSync } from 'child_process';
 import { extractUrlsFromText, analyzeUrl, isHlsContentType, isM3u8Url, normalizeMediaUrl } from '../src/utils/url-extractor.ts';
 import { scanHtmlForM3u8AndMedia } from '../src/utils/m3u8-detector.ts';
-import { parseMasterPlaylist, selectTargetVariant } from '../src/utils/m3u8-parser.ts';
+import { parseMasterPlaylist, selectTargetVariant, detectHlsEncryption, parseHlsKeyTag, parseMediaPlaylist } from '../src/utils/m3u8-parser.ts';
+import { validateSegmentBytes, validateHlsSegments } from '../src/utils/segment-validator.ts';
+import { isSignedUrl, parseUrlExpiration, isUrlExpired, shouldRefreshManifest, analyzeSignedUrl } from '../src/utils/signed-url.ts';
 import { normalizeCookies, mergeCookieStrings } from '../src/utils/cookie-manager.ts';
 import { FallbackOrchestrator } from '../src/engines/orchestrator.ts';
 import { buildFfmpegHeaders } from '../src/engines/ffmpeg-engine.ts';
@@ -505,6 +507,271 @@ async function runSelfAudit() {
   assert(
     recorded.length > 0 && recorded[0].channelMessageId === 8842,
     'Queue tracks completed channel uploads in job history'
+  );
+
+  // =========================================================================
+  // TEST 12: HLS Encryption Detection & Discrimination (AES-128 vs SAMPLE-AES vs DRM)
+  // =========================================================================
+  console.log('\n--- Test 12: HLS Encryption Detection & Discrimination ---');
+
+  // 12.1 Standard AES-128 Encryption (identity) -> Supported
+  const aes128Manifest = `
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-KEY:METHOD=AES-128,URI="https://example.com/enc.key",IV=0x1234567890abcdef1234567890abcdef
+#EXTINF:10.0,
+segment_0.ts
+#EXTINF:10.0,
+segment_1.ts
+#EXT-X-ENDLIST
+  `.trim();
+
+  const aesAnalysis = detectHlsEncryption(aes128Manifest);
+  assert(aesAnalysis.hasEncryption === true, 'Detects #EXT-X-KEY tag presence');
+  assert(aesAnalysis.primaryMethod === 'AES-128', 'Extracts AES-128 encryption method');
+  assert(aesAnalysis.isAes128 === true, 'Identifies standard AES-128 encryption');
+  assert(aesAnalysis.isSupported === true, 'Marks AES-128 as supported by standard toolchain');
+  assert(aesAnalysis.isDrm === false, 'Recognizes AES-128 is not DRM');
+  assert(aesAnalysis.keyUri === 'https://example.com/enc.key', 'Extracts key URI accurately');
+
+  // 12.2 SAMPLE-AES Encryption -> Unsupported, reports reason without claiming downloadability
+  const sampleAesManifest = `
+#EXTM3U
+#EXT-X-VERSION:5
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="https://example.com/sample.key",KEYFORMAT="identity"
+#EXTINF:6.0,
+sample_0.ts
+#EXT-X-ENDLIST
+  `.trim();
+
+  const sampleAesAnalysis = detectHlsEncryption(sampleAesManifest);
+  assert(sampleAesAnalysis.isSampleAes === true, 'Identifies SAMPLE-AES encryption method');
+  assert(sampleAesAnalysis.isSupported === false, 'Strict policy: SAMPLE-AES marked unsupported (no false claim)');
+  assert(sampleAesAnalysis.reason?.includes('SAMPLE-AES') === true, 'Provides explicit unsupported reason for SAMPLE-AES');
+
+  // 12.3 Widevine DRM Detection -> Strict DRM flag, never bypass
+  const widevineManifest = `
+#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",KEYFORMATVERSIONS="1",URI="data:text/plain;base64,AAAANHBzc2gAAAAA7e+L..."
+#EXTINF:4.0,
+widevine_segment_0.m4s
+#EXT-X-ENDLIST
+  `.trim();
+
+  const widevineAnalysis = detectHlsEncryption(widevineManifest);
+  assert(widevineAnalysis.isDrm === true, 'Identifies Widevine DRM system via URN UUID');
+  assert(widevineAnalysis.drmSystem === 'Widevine', 'Labels DRM system as Widevine');
+  assert(widevineAnalysis.isSupported === false, 'Widevine DRM marked as unsupported (no bypass attempt)');
+
+  // 12.4 FairPlay DRM Detection (skd:// scheme)
+  const fairplayManifest = `
+#EXTM3U
+#EXT-X-VERSION:5
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://fps.apple.com/key",KEYFORMAT="com.apple.streamingkeydelivery",KEYFORMATVERSIONS="1"
+#EXTINF:6.0,
+fairplay_0.ts
+#EXT-X-ENDLIST
+  `.trim();
+
+  const fairplayAnalysis = detectHlsEncryption(fairplayManifest);
+  assert(fairplayAnalysis.isDrm === true, 'Identifies FairPlay DRM via skd:// protocol');
+  assert(fairplayAnalysis.drmSystem === 'FairPlay', 'Labels DRM system as FairPlay');
+  assert(fairplayAnalysis.isSupported === false, 'FairPlay DRM marked as unsupported');
+
+  // 12.5 PlayReady DRM Detection
+  const playreadyManifest = `
+#EXTM3U
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:text/xml...",KEYFORMAT="com.microsoft.playready"
+#EXTINF:6.0,
+playready_0.mp4
+#EXT-X-ENDLIST
+  `.trim();
+
+  const playreadyAnalysis = detectHlsEncryption(playreadyManifest);
+  assert(playreadyAnalysis.isDrm === true, 'Identifies PlayReady DRM via KEYFORMAT');
+  assert(playreadyAnalysis.drmSystem === 'PlayReady', 'Labels DRM system as PlayReady');
+
+  // 12.6 ClearKey DRM Detection
+  const clearkeyManifest = `
+#EXTM3U
+#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="org.w3.clearkey",URI="data:base64,..."
+#EXTINF:6.0,
+clearkey_0.ts
+#EXT-X-ENDLIST
+  `.trim();
+
+  const clearkeyAnalysis = detectHlsEncryption(clearkeyManifest);
+  assert(clearkeyAnalysis.isDrm === true, 'Identifies ClearKey DRM');
+
+  // 12.7 Unencrypted Stream
+  const plainManifest = `
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+chunk_0.ts
+#EXT-X-ENDLIST
+  `.trim();
+
+  const plainAnalysis = detectHlsEncryption(plainManifest);
+  assert(plainAnalysis.hasEncryption === false, 'Identifies unencrypted HLS stream');
+  assert(plainAnalysis.isSupported === true, 'Unencrypted stream marked as fully supported');
+
+  // =========================================================================
+  // TEST 13: Segment Validation & Bitstream Payload Inspection
+  // =========================================================================
+  console.log('\n--- Test 13: Segment Validation & Payload Inspection ---');
+
+  // 13.1 MPEG-TS Segment Sync byte (0x47) validation
+  const validTsPacket = new Uint8Array(376);
+  validTsPacket[0] = 0x47;   // First sync byte
+  validTsPacket[188] = 0x47; // Second sync byte at 188 boundary
+  const tsCheck = validateSegmentBytes(validTsPacket);
+  assert(tsCheck.valid === true, 'Validates genuine MPEG-TS packet sync byte (0x47)');
+
+  // 13.2 fMP4 Segment Box header validation
+  const validFmp4Header = new Uint8Array([
+    0x00, 0x00, 0x00, 0x20, // size: 32
+    0x66, 0x74, 0x79, 0x70, // 'ftyp'
+    0x69, 0x73, 0x6f, 0x6d, // 'isom'
+    0x00, 0x00, 0x02, 0x00, // minor version
+    0x6d, 0x70, 0x34, 0x31, // 'mp41'
+    0x6d, 0x70, 0x34, 0x32, // 'mp42'
+    0x69, 0x73, 0x6f, 0x6d, // 'isom'
+    0x00, 0x00, 0x00, 0x00,
+  ]);
+  const fmp4Check = validateSegmentBytes(validFmp4Header);
+  assert(fmp4Check.valid === true, 'Validates genuine fMP4 ISOBMFF box container');
+
+  // 13.3 HTML Error response disguised as 200 OK (CDN captcha / 403 / Cloudflare)
+  const fakeHtmlSegment = new TextEncoder().encode('<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body>Access Denied</body></html>');
+  const fakeCheck = validateSegmentBytes(fakeHtmlSegment);
+  assert(fakeCheck.valid === false, 'Rejects HTML error page disguised as media segment');
+  assert(fakeCheck.reason?.includes('HTML/JSON error page') === true, 'Reports HTML masquerading reason');
+
+  // 13.4 Truncated / empty segment
+  const emptySegment = new Uint8Array(4);
+  const emptyCheck = validateSegmentBytes(emptySegment);
+  assert(emptyCheck.valid === false, 'Rejects truncated segment under 16 bytes');
+
+  // 13.5 Parse Media Playlist Segments and Target URI resolution
+  const playlistWithBase = `
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:5.0,
+seg-001.mp4
+#EXTINF:5.0,
+seg-002.mp4
+#EXT-X-ENDLIST
+  `.trim();
+
+  const parsedMedia = parseMediaPlaylist(playlistWithBase, 'https://cdn.example.com/hls/master.m3u8');
+  assert(parsedMedia.segments.length === 2, 'Extracts all media segments from playlist');
+  assert(parsedMedia.initSegmentUri === 'https://cdn.example.com/hls/init.mp4', 'Resolves init segment relative URL to base');
+  assert(parsedMedia.segments[0].uri === 'https://cdn.example.com/hls/seg-001.mp4', 'Resolves segment relative URL to base');
+
+  // 13.6 Direct DRM manifest segment validation immediately returns DRM_PROTECTED
+  const drmValidation = await validateHlsSegments('https://example.com/drm.m3u8', widevineManifest);
+  assert(drmValidation.valid === false, 'Segment validator rejects DRM manifest without network probe');
+  assert(drmValidation.errorType === 'DRM_PROTECTED', 'Returns DRM_PROTECTED errorCategory');
+  assert(drmValidation.isDrm === true, 'Flags isDrm: true on result');
+
+  // =========================================================================
+  // TEST 14: Expired Signed URL Detection & Orchestrator Re-Discovery Flow
+  // =========================================================================
+  console.log('\n--- Test 14: Expired Signed URL Detection & Re-Discovery ---');
+
+  // 14.1 Signed URL Detection
+  const signedUrl1 = 'https://cdn.example.com/video/master.m3u8?token=xyz123&expires=1711234567';
+  const signedUrl2 = 'https://stream.server.org/live/playlist.m3u8?sig=abcd9876&wsTime=6600a1b2';
+  const plainUrl = 'https://cdn.example.com/video/master.m3u8';
+
+  assert(isSignedUrl(signedUrl1) === true, 'Detects token and expires query parameters');
+  assert(isSignedUrl(signedUrl2) === true, 'Detects sig and wsTime query parameters');
+  assert(isSignedUrl(plainUrl) === false, 'Unsigned URL recognized as not signed');
+
+  // 14.2 Expiration Timestamp Extraction
+  const pastUnixSec = Math.floor(Date.now() / 1000) - 300; // Expired 5 mins ago
+  const futureUnixSec = Math.floor(Date.now() / 1000) + 3600; // Valid for 1 hour
+
+  const expiredSignedUrl = `https://cdn.example.com/live.m3u8?token=abc&expires=${pastUnixSec}`;
+  const validSignedUrl = `https://cdn.example.com/live.m3u8?token=abc&expires=${futureUnixSec}`;
+
+  assert(isUrlExpired(expiredSignedUrl) === true, 'Detects expired signed URL timestamp');
+  assert(isUrlExpired(validSignedUrl) === false, 'Valid future signed URL not marked as expired');
+
+  // 14.3 Hex wsTime parameter parsing
+  const pastHex = (Math.floor(Date.now() / 1000) - 100).toString(16);
+  const hexUrl = `https://cdn.example.com/live.m3u8?wsSecret=123&wsTime=${pastHex}`;
+  assert(isUrlExpired(hexUrl) === true, 'Correctly parses and checks hex timestamp (wsTime)');
+
+  // 14.4 shouldRefreshManifest Policy
+  assert(
+    shouldRefreshManifest(Date.now() - 60000, signedUrl1, 45000) === true,
+    'Policy: signed manifest retained over 45s must be refreshed from source'
+  );
+  assert(
+    shouldRefreshManifest(Date.now() - 5000, validSignedUrl, 45000) === false,
+    'Policy: fresh signed manifest (< 45s) does not prematurely refresh'
+  );
+  assert(
+    shouldRefreshManifest(Date.now() - 1000, expiredSignedUrl, 45000) === true,
+    'Policy: expired signed URL immediately requires source re-discovery'
+  );
+
+  // 14.5 Orchestrator DRM & Expired URL Protection Policy Execution
+  const auditOrchestrator = new FallbackOrchestrator();
+
+  // A. DRM Protected Stream: Orchestrator halts immediately and refuses bypass
+  const mockDrmFile = path.join(config.tempDir, `mock_drm_${Date.now()}.m3u8`);
+  fs.writeFileSync(mockDrmFile, widevineManifest);
+
+  const drmTask: DownloadTask = {
+    id: 'test-drm-task',
+    chatId: 1001,
+    messageId: 101,
+    originalUrl: 'https://example.com/movie-page',
+    streamUrl: mockDrmFile,
+    status: 'queued',
+    failedEngines: [],
+    subprocesses: [],
+    abortController: new AbortController(),
+    tempDir: config.tempDir,
+    startTime: Date.now(),
+  };
+
+  // Mock engine download returning DRM_PROTECTED
+  const drmEngineResult = await auditOrchestrator.executeWithFallback(drmTask);
+  assert(
+    drmTask.status === 'failed',
+    'Task marked failed when DRM is detected'
+  );
+  assert(
+    drmEngineResult.errorType === 'DRM_PROTECTED',
+    'Orchestrator halts immediately returning DRM_PROTECTED errorType'
+  );
+
+  // B. Expired URL re-discovery simulation
+  const expiredTask: DownloadTask = {
+    id: 'test-expired-task',
+    chatId: 1001,
+    messageId: 102,
+    originalUrl: 'https://example.com/video-watch-page',
+    streamUrl: expiredSignedUrl,
+    status: 'queued',
+    failedEngines: [],
+    subprocesses: [],
+    abortController: new AbortController(),
+    tempDir: '/tmp',
+    startTime: Date.now(),
+    rediscoveryCount: 0,
+  };
+
+  assert(
+    shouldRefreshManifest(Date.now(), expiredTask.streamUrl) === true,
+    'Expired stream URL triggers refresh policy before download'
   );
 
   // SUMMARY

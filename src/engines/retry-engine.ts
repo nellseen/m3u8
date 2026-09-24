@@ -6,6 +6,9 @@ import { DownloadTask, EngineResult } from '../types.ts';
 import { getFfmpegPath } from '../utils/system.ts';
 import { validateMediaFile, remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
 import { buildFfmpegHeaders } from './ffmpeg-engine.ts';
+import { isUrlExpired } from '../utils/signed-url.ts';
+import { isM3u8Url } from '../utils/url-extractor.ts';
+import { detectHlsEncryption } from '../utils/m3u8-parser.ts';
 import { logger } from '../logger.ts';
 
 export class RetryEngine extends BaseEngine {
@@ -25,7 +28,15 @@ export class RetryEngine extends BaseEngine {
       task.streamUrl,
     ].filter(Boolean) as string[];
 
-    const uniqueCandidates = Array.from(new Set(candidates)).filter(u => u !== task.originalUrl);
+    const uniqueCandidates = Array.from(new Set(candidates))
+      .filter(u => u !== task.originalUrl)
+      .filter(u => {
+        if (isUrlExpired(u)) {
+          logger.info(`[Engine 6] Skipping expired signed URL candidate: ${u}`);
+          return false;
+        }
+        return true;
+      });
 
     if (uniqueCandidates.length === 0) {
       return {

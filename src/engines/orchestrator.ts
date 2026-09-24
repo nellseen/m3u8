@@ -19,6 +19,42 @@ function classifyError(errStr: string, explicitType?: ErrorCategory, hasStreamUr
     return explicitType;
   }
   const lower = errStr.toLowerCase();
+
+  // Strict DRM check
+  if (
+    lower.includes('drm') ||
+    lower.includes('widevine') ||
+    lower.includes('fairplay') ||
+    lower.includes('playready') ||
+    lower.includes('clearkey')
+  ) {
+    return 'DRM_PROTECTED';
+  }
+
+  // Unsupported encryption check (e.g. SAMPLE-AES)
+  if (lower.includes('sample-aes') || lower.includes('unsupported encryption')) {
+    return 'UNSUPPORTED_ENCRYPTION';
+  }
+
+  // Expired URL & token signature check
+  if (
+    lower.includes('expired') ||
+    lower.includes('403 forbidden') ||
+    lower.includes('401 unauthorized') ||
+    lower.includes('token or session has expired')
+  ) {
+    return 'EXPIRED_URL';
+  }
+
+  // Segment validation error check
+  if (
+    lower.includes('segment') ||
+    lower.includes('bitstream') ||
+    lower.includes('truncated segment')
+  ) {
+    return 'SEGMENT_ERROR';
+  }
+
   if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('abort')) {
     return 'TIMEOUT';
   }
@@ -145,6 +181,62 @@ export class FallbackOrchestrator {
 
         // Kill any subprocesses spawned by this engine
         killTaskProcesses(task);
+
+        // 1. Strict DRM & Unsupported Encryption Policy:
+        // Do not pretend success, do not attempt to bypass DRM. Report reason and halt immediately.
+        if (errorCategory === 'DRM_PROTECTED' || result.details?.isDrm) {
+          logger.warn(`[Orchestrator] DRM protected media detected. Halting pipeline as DRM cannot be bypassed: ${reason}`);
+          task.status = 'failed';
+          task.errorCategory = 'DRM_PROTECTED';
+          return {
+            success: false,
+            engineName: engine.name,
+            error: reason,
+            errorType: 'DRM_PROTECTED',
+            details: result.details,
+          };
+        }
+
+        if (errorCategory === 'UNSUPPORTED_ENCRYPTION') {
+          logger.warn(`[Orchestrator] Unsupported encryption scheme detected. Halting pipeline: ${reason}`);
+          task.status = 'failed';
+          task.errorCategory = 'UNSUPPORTED_ENCRYPTION';
+          return {
+            success: false,
+            engineName: engine.name,
+            error: reason,
+            errorType: 'UNSUPPORTED_ENCRYPTION',
+            details: result.details,
+          };
+        }
+
+        // 2. Expired Signed URL Flow:
+        // discover -> download segera. Jika URL expired: re-discover source -> ambil manifest baru -> download ulang.
+        const isExpiredTrigger =
+          errorCategory === 'EXPIRED_URL' ||
+          Boolean(result.details?.isExpiredUrl) ||
+          reason.toLowerCase().includes('expired');
+
+        if (isExpiredTrigger && task.originalUrl && task.streamUrl && task.originalUrl !== task.streamUrl) {
+          const rediscoveryAttempts = task.rediscoveryCount || 0;
+          if (rediscoveryAttempts < 1) {
+            task.rediscoveryCount = rediscoveryAttempts + 1;
+            logger.info(
+              `[Orchestrator] Expired signed URL detected (${reason}). Re-discovering source page (${task.originalUrl}) to obtain fresh manifest...`
+            );
+            onProgressUpdate?.('🔄 URL/Manifest expired. Mengambil manifest baru dari sumber...');
+
+            // Clear stale expired manifest, streamUrl and candidates
+            task.streamUrl = undefined;
+            task.discoveredMedia = [];
+            task.discoveredAt = undefined;
+            task.encryption = undefined;
+
+            // Restart orchestrator loop to re-discover source page and download immediately
+            i = -1;
+            continue;
+          }
+        }
 
         // Notify progress editor about fallback
         if (i < this.engines.length - 1) {

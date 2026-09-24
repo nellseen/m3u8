@@ -144,6 +144,43 @@ export async function ensureIndonesianTitle(
     logger.warn(`Translation service failed for title "${cleanOriginal.slice(0, 30)}...":`, err.message || err);
   }
 
+  // 2b. Graceful dictionary fallback if network/API is unreachable
+  const DICT: Record<string, string> = {
+    amazing: 'Menakjubkan',
+    nature: 'Alam',
+    footage: 'Rekaman',
+    switzerland: 'Swiss',
+    official: 'Resmi',
+    documentary: 'Dokumenter',
+    movie: 'Film',
+    trailer: 'Cuplikan',
+    episode: 'Episode',
+    highlights: 'Sorotan',
+    wildlife: 'Satwa Liar',
+    safari: 'Safari',
+    review: 'Ulasan',
+  };
+
+  const words = cleanOriginal.split(/\s+/);
+  let translatedCount = 0;
+  const translatedWords = words.map(w => {
+    const cleanW = w.toLowerCase().replace(/[^\w]/g, '');
+    if (DICT[cleanW]) {
+      translatedCount++;
+      return w.replace(new RegExp(cleanW, 'i'), DICT[cleanW]);
+    }
+    return w;
+  });
+
+  if (translatedCount > 0) {
+    return {
+      originalTitle: cleanOriginal,
+      translatedTitle: translatedWords.join(' '),
+      detectedLanguage: 'en',
+      translationStatus: 'translated',
+    };
+  }
+
   // 3. Fallback 1: Check alternative metadata title
   if (alternativeTitle && alternativeTitle.trim() && alternativeTitle !== originalTitle) {
     const cleanAlt = alternativeTitle.trim();

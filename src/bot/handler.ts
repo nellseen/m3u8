@@ -584,7 +584,17 @@ export class BotHandler {
     } catch (err: any) {
       const errorMsg = err?.message || String(err);
       logger.error(`Download job failed for ${targetUrl}:`, errorMsg);
-      await progressTracker.markFailed(errorMsg.slice(0, 300));
+
+      let userFacingError = errorMsg;
+      if (errorMsg.includes('DRM Protection') || errorMsg.includes('DRM')) {
+        userFacingError = `🔒 **Konten Dilindungi DRM (Digital Rights Management)**\n\n${errorMsg}\n\n_Sesuai kebijakan: DRM memerlukan lisensi proprietary yang tidak tersedia dan tidak dapat dibypass._`;
+      } else if (errorMsg.includes('SAMPLE-AES')) {
+        userFacingError = `🔒 **Enkripsi SAMPLE-AES Terdeteksi**\n\n${errorMsg}\n\n_Format enkripsi sample-level ini memerlukan dekripsi CDM berlisensi yang tidak didukung._`;
+      } else if (errorMsg.includes('Expired') || errorMsg.includes('expired') || errorMsg.includes('Forbidden/Unauthorized')) {
+        userFacingError = `⏱️ **Tautan / Token Segment Kadaluarsa**\n\n${errorMsg}\n\n_Silakan kirimkan tautan baru dari browser Anda._`;
+      }
+
+      await progressTracker.markFailed(userFacingError.slice(0, 400));
     }
   }
 }

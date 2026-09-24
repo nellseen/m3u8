@@ -29,7 +29,43 @@ export type ErrorCategory =
   | 'TRANSLATION_ERROR'
   | 'THUMBNAIL_ERROR'
   | 'TELEGRAM_UPLOAD_ERROR'
-  | 'STORAGE_ERROR';
+  | 'STORAGE_ERROR'
+  | 'DRM_PROTECTED'
+  | 'UNSUPPORTED_ENCRYPTION'
+  | 'SEGMENT_ERROR'
+  | 'EXPIRED_URL';
+
+export type HlsEncryptionMethod =
+  | 'NONE'
+  | 'AES-128'
+  | 'SAMPLE-AES'
+  | 'SAMPLE-AES-CTR'
+  | 'SAMPLE-AES-CENC'
+  | 'DRM'
+  | 'UNKNOWN';
+
+export interface HlsKeyTag {
+  method: string;
+  uri?: string;
+  iv?: string;
+  keyFormat?: string;
+  keyFormatVersions?: string;
+  rawTag: string;
+}
+
+export interface HlsEncryptionAnalysis {
+  hasEncryption: boolean;
+  primaryMethod: HlsEncryptionMethod;
+  isDrm: boolean;
+  isSampleAes: boolean;
+  isAes128: boolean;
+  isSupported: boolean;
+  keyFormat?: string;
+  keyUri?: string;
+  drmSystem?: 'Widevine' | 'FairPlay' | 'PlayReady' | 'ClearKey' | 'Generic DRM';
+  reason?: string;
+  keys: HlsKeyTag[];
+}
 
 export interface ExtractedMedia {
   streamUrl: string;
@@ -39,6 +75,9 @@ export interface ExtractedMedia {
   isDash?: boolean;
   mimeType?: string;
   cookies?: string;
+  discoveredAt?: number;
+  isSigned?: boolean;
+  expiresAt?: number;
 }
 
 export interface ExtractedMetadata {
@@ -117,6 +156,9 @@ export interface DownloadTask {
   abortController: AbortController;
   subprocesses: number[]; // PIDs to kill on cancel/cleanup
   errorCategory?: ErrorCategory;
+  encryption?: HlsEncryptionAnalysis;
+  discoveredAt?: number;
+  rediscoveryCount?: number;
   channelMessageId?: number;
   channelPeerId?: string;
   channelPostUrl?: string;

@@ -10,6 +10,8 @@ import { normalizeCookies, mergeCookieStrings } from '../utils/cookie-manager.ts
 import { remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
 import { formatBytes } from '../utils/system.ts';
 import { extractHtmlMetadata } from '../utils/metadata.ts';
+import { isSignedUrl, isUrlExpired } from '../utils/signed-url.ts';
+import { detectHlsEncryption } from '../utils/m3u8-parser.ts';
 import { logger } from '../logger.ts';
 
 export class DirectEngine extends BaseEngine {
@@ -33,6 +35,7 @@ export class DirectEngine extends BaseEngine {
       if (urlInfo.isDirectM3u8) {
         onProgress?.('🔎 Direct M3U8 detected, delegating to HLS pipeline...', 20);
         task.streamUrl = targetUrl;
+        task.discoveredAt = Date.now();
         return {
           success: false,
           engineName: this.name,
@@ -106,6 +109,7 @@ export class DirectEngine extends BaseEngine {
       if (isHlsContentType(contentType)) {
         logger.info(`Engine 1: HTTP Content-Type indicates HLS stream (${contentType}) at ${targetUrl}`);
         task.streamUrl = targetUrl;
+        task.discoveredAt = Date.now();
         task.streamHeaders = {
           'user-agent': requestHeaders['User-Agent'],
           referer: targetUrl,
@@ -146,11 +150,24 @@ export class DirectEngine extends BaseEngine {
       if (html.trim().startsWith('#EXTM3U')) {
         logger.info(`Engine 1: URL returned raw M3U8 playlist content: ${targetUrl}`);
         task.streamUrl = targetUrl;
+        task.discoveredAt = Date.now();
         task.streamHeaders = {
           'user-agent': requestHeaders['User-Agent'],
           referer: targetUrl,
           origin: requestHeaders['Origin'],
         };
+
+        const enc = detectHlsEncryption(html);
+        if (enc.isDrm) {
+          return {
+            success: false,
+            engineName: this.name,
+            error: enc.reason,
+            errorType: 'DRM_PROTECTED',
+            details: { isDrm: true, encryption: enc },
+          };
+        }
+
         return {
           success: false,
           engineName: this.name,
@@ -169,6 +186,7 @@ export class DirectEngine extends BaseEngine {
       if (scanResult.primaryM3u8) {
         logger.info(`Engine 1 deep scan discovered M3U8: ${scanResult.primaryM3u8}`);
         task.streamUrl = scanResult.primaryM3u8;
+        task.discoveredAt = Date.now();
         task.streamHeaders = {
           'user-agent': requestHeaders['User-Agent'],
           referer: targetUrl,
@@ -183,6 +201,8 @@ export class DirectEngine extends BaseEngine {
             streamUrl: u,
             isHls: true,
             headers: { ...task.streamHeaders },
+            discoveredAt: Date.now(),
+            isSigned: isSignedUrl(u),
           });
         }
 

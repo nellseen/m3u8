@@ -12,6 +12,7 @@ import { isHlsContentType, isM3u8Url, normalizeMediaUrl } from '../utils/url-ext
 import { scanHtmlForM3u8AndMedia } from '../utils/m3u8-detector.ts';
 import { normalizeCookies, mergeCookieStrings } from '../utils/cookie-manager.ts';
 import { extractHtmlMetadata } from '../utils/metadata.ts';
+import { isSignedUrl } from '../utils/signed-url.ts';
 import { FfmpegEngine } from './ffmpeg-engine.ts';
 import { YtdlpEngine } from './ytdlp-engine.ts';
 import { StreamlinkEngine } from './streamlink-engine.ts';
@@ -134,6 +135,8 @@ export class PlaywrightEngine extends BaseEngine {
             isHls,
             isDash,
             mimeType,
+            discoveredAt: Date.now(),
+            isSigned: isSignedUrl(norm),
           });
         }
 
@@ -346,6 +349,7 @@ export class PlaywrightEngine extends BaseEngine {
       if (detectedStreamUrl) {
         logger.info(`[Playwright] Successfully intercepted stream: ${detectedStreamUrl}`);
         task.streamUrl = detectedStreamUrl;
+        task.discoveredAt = Date.now();
         task.streamHeaders = detectedHeaders;
         task.discoveredMedia = discoveredMedia;
 

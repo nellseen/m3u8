@@ -6,7 +6,9 @@ import { DownloadTask, EngineResult } from '../types.ts';
 import { getFfmpegPath } from '../utils/system.ts';
 import { validateMediaFile, probeMedia } from '../utils/ffmpeg.ts';
 import { isM3u8Url } from '../utils/url-extractor.ts';
-import { parseMasterPlaylist, HlsVariant } from '../utils/m3u8-parser.ts';
+import { parseMasterPlaylist, HlsVariant, detectHlsEncryption } from '../utils/m3u8-parser.ts';
+import { validateHlsSegments } from '../utils/segment-validator.ts';
+import { isUrlExpired } from '../utils/signed-url.ts';
 import { normalizeCookies } from '../utils/cookie-manager.ts';
 import { logger } from '../logger.ts';
 
@@ -106,7 +108,51 @@ export class FfmpegEngine extends BaseEngine {
     let separateAudioTrackUrl: string | undefined;
 
     if (isM3u8Url(rawTargetUrl) || rawTargetUrl.endsWith('.m3u8') || rawTargetUrl.includes('.m3u8')) {
-      onProgress?.('🔎 Inspecting M3U8 Master Playlist variants & audio tracks...', 32);
+      onProgress?.('🔎 Deteksi enkripsi & validasi segment HLS...', 30);
+
+      // Check if signed URL is already expired prior to network call
+      if (isUrlExpired(rawTargetUrl)) {
+        logger.warn(`[FFmpeg] Stream URL signature is already expired: ${rawTargetUrl}`);
+        return {
+          success: false,
+          engineName: this.name,
+          error: 'Signed stream URL timestamp has expired. Re-discovery required.',
+          errorType: 'EXPIRED_URL',
+          details: { isExpiredUrl: true },
+        };
+      }
+
+      // Perform strict segment and encryption validation
+      const segmentValidation = await validateHlsSegments(
+        rawTargetUrl,
+        undefined,
+        task.streamHeaders,
+        task.cookies
+      );
+
+      if (!segmentValidation.valid) {
+        logger.warn(`[FFmpeg] Segment validation failed: ${segmentValidation.error}`);
+        return {
+          success: false,
+          engineName: this.name,
+          error: segmentValidation.error || 'Segment validation failed',
+          errorType: segmentValidation.errorType || 'SEGMENT_ERROR',
+          details: {
+            isDrm: segmentValidation.isDrm,
+            isExpiredUrl: segmentValidation.isExpiredUrl,
+            encryption: segmentValidation.encryption,
+          },
+        };
+      }
+
+      if (segmentValidation.encryption) {
+        task.encryption = segmentValidation.encryption;
+        if (segmentValidation.encryption.isAes128) {
+          logger.info(`[FFmpeg] AES-128 standard encryption verified with accessible key. Using FFmpeg crypto protocol.`);
+        }
+      }
+
+      onProgress?.('🔎 Inspecting M3U8 Master Playlist variants & audio tracks...', 33);
       const manifestText = await this.fetchManifestContent(rawTargetUrl, task.streamHeaders, task.cookies);
 
       if (manifestText && manifestText.includes('#EXT-X-STREAM-INF')) {
@@ -321,11 +367,34 @@ export class FfmpegEngine extends BaseEngine {
 
           const errMsg = stderr || `FFmpeg failed with exit code ${code}`;
           logger.warn(`FFmpeg engine failed: ${errMsg.slice(-250)}`);
+
+          let errorType: any = 'FFMPEG_ERROR';
+          const lower = errMsg.toLowerCase();
+          if (
+            lower.includes('403 forbidden') ||
+            lower.includes('401 unauthorized') ||
+            lower.includes('server returned 403') ||
+            lower.includes('server returned 401')
+          ) {
+            errorType = 'EXPIRED_URL';
+          } else if (lower.includes('404 not found') || lower.includes('server returned 404')) {
+            errorType = 'NO_MEDIA_FOUND';
+          } else if (lower.includes('drm') || lower.includes('widevine') || lower.includes('fairplay')) {
+            errorType = 'DRM_PROTECTED';
+          } else if (lower.includes('sample-aes')) {
+            errorType = 'UNSUPPORTED_ENCRYPTION';
+          } else if (lower.includes('connection reset') || lower.includes('econnreset') || lower.includes('server returned 5')) {
+            errorType = 'NETWORK_ERROR';
+          }
+
           resolve({
             success: false,
             engineName: this.name,
             error: errMsg.slice(0, 300),
-            errorType: 'FFMPEG_ERROR',
+            errorType,
+            details: {
+              isExpiredUrl: errorType === 'EXPIRED_URL',
+            },
           });
         });
 
