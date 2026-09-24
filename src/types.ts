@@ -204,6 +204,7 @@ export type LogCategory =
   | 'DISCOVERY'
   | 'M3U8'
   | 'HLS'
+  | 'ARIA2'
   | 'PLAYWRIGHT'
   | 'FFMPEG'
   | 'YTDLP'
@@ -257,5 +258,6 @@ export interface BotConfig {
     ytdlp?: string;
     streamlink?: string;
     chromium?: string;
+    aria2?: string;
   };
 }

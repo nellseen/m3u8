@@ -5,6 +5,7 @@ import { PlaywrightEngine } from './playwright-engine.ts';
 import { StreamlinkEngine } from './streamlink-engine.ts';
 import { YtdlpEngine } from './ytdlp-engine.ts';
 import { FfmpegEngine } from './ffmpeg-engine.ts';
+import { Aria2Engine } from './aria2-engine.ts';
 import { RetryEngine } from './retry-engine.ts';
 import { DownloadTask, EngineResult, ErrorCategory } from '../types.ts';
 import { killTaskProcesses } from '../utils/cleaner.ts';
@@ -15,6 +16,7 @@ import { isM3u8Url } from '../utils/url-extractor.ts';
 import { isUrlExpired } from '../utils/signed-url.ts';
 import { detectHlsEncryption, parseHlsManifest } from '../utils/m3u8-parser.ts';
 import { planEngineRoute, EngineRegistry, RouteDecision } from '../utils/source-router.ts';
+import { buildPropagatedHeaders } from '../utils/header-propagator.ts';
 
 function classifyError(errStr: string, explicitType?: ErrorCategory, hasStreamUrl = false): ErrorCategory {
   if (explicitType) {
@@ -104,6 +106,7 @@ export class FallbackOrchestrator {
     const streamlink = new StreamlinkEngine();
     const ytdlp = new YtdlpEngine();
     const ffmpeg = new FfmpegEngine();
+    const aria2 = new Aria2Engine();
     const retry = new RetryEngine();
 
     this.engineRegistry = {
@@ -112,11 +115,12 @@ export class FallbackOrchestrator {
       streamlink,
       ytdlp,
       ffmpeg,
+      aria2,
       retry,
     };
 
-    // Registered all 6 engines for inventory queries
-    this.engines = [direct, playwright, streamlink, ytdlp, ffmpeg, retry];
+    // Registered all 7 engines for inventory queries
+    this.engines = [direct, playwright, streamlink, ytdlp, aria2, ffmpeg, retry];
   }
 
   getEngines(): BaseEngine[] {
@@ -157,15 +161,14 @@ export class FallbackOrchestrator {
       if (fs.existsSync(targetUrl)) {
         content = fs.readFileSync(targetUrl, 'utf8');
       } else if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
+        const reqHeaders = buildPropagatedHeaders(task.streamHeaders, task.cookies, {
+          targetUrl,
+          defaultUserAgent:
+            task.streamHeaders?.['user-agent'] ||
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        });
         const res = await fetch(targetUrl, {
-          headers: {
-            'User-Agent':
-              task.streamHeaders?.['user-agent'] ||
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            Accept:
-              'application/vnd.apple.mpegurl,application/x-mpegURL,application/mpegurl,*/*;q=0.8',
-            Referer: task.streamHeaders?.['referer'] || targetUrl,
-          },
+          headers: reqHeaders,
           signal: AbortSignal.timeout(8000),
         });
         if (res.ok) {
@@ -292,6 +295,7 @@ export class FallbackOrchestrator {
           logger.info(`[Orchestrator] Manifest discovered (${task.streamUrl}). Re-planning route to bypass any remaining browser overhead.`);
           // Switch to Direct M3U8 pipeline immediately
           activePipeline = [
+            this.engineRegistry.aria2,
             this.engineRegistry.ffmpeg,
             this.engineRegistry.ytdlp,
             this.engineRegistry.streamlink,

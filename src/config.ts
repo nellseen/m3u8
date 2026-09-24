@@ -77,6 +77,7 @@ export const config: BotConfig = {
     ytdlp: getEnvString('YTDLP_PATH', ''),
     streamlink: getEnvString('STREAMLINK_PATH', ''),
     chromium: getEnvString('CHROMIUM_PATH', ''),
+    aria2: getEnvString('ARIA2_PATH', ''),
   },
 };
 

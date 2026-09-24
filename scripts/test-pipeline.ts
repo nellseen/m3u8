@@ -12,14 +12,32 @@ import {
   parseHlsManifest,
   detectPlaylistType,
   resolveHlsUri,
+  resolveSegmentAgainstMediaPlaylist,
   parseByteRange,
 } from '../src/utils/m3u8-parser.ts';
 import { categorizeSourceUrl, planEngineRoute } from '../src/utils/source-router.ts';
 import { validateSegmentBytes, validateHlsSegments } from '../src/utils/segment-validator.ts';
-import { isSignedUrl, parseUrlExpiration, isUrlExpired, shouldRefreshManifest, analyzeSignedUrl } from '../src/utils/signed-url.ts';
+import {
+  isSignedUrl,
+  parseUrlExpiration,
+  isUrlExpired,
+  shouldRefreshManifest,
+  analyzeSignedUrl,
+  isExpiredFailure,
+  refreshStreamManifest,
+} from '../src/utils/signed-url.ts';
 import { normalizeCookies, mergeCookieStrings } from '../src/utils/cookie-manager.ts';
 import { FallbackOrchestrator } from '../src/engines/orchestrator.ts';
 import { buildFfmpegHeaders } from '../src/engines/ffmpeg-engine.ts';
+import {
+  buildPropagatedHeaders,
+  buildAria2Headers,
+  buildFfmpegHeaderString,
+  buildYtdlpHeaderArgs,
+  buildStreamlinkHeaderArgs,
+} from '../src/utils/header-propagator.ts';
+import { Aria2Engine } from '../src/engines/aria2-engine.ts';
+import { isAria2Available } from '../src/utils/system.ts';
 import {
   probeMedia,
   validateMediaFile,
@@ -272,7 +290,7 @@ async function runSelfAudit() {
   console.log('\n--- 4. Testing Fallback Orchestrator Engines ---');
   const orchestrator = new FallbackOrchestrator();
   const engines = orchestrator.getEngines();
-  assert(engines.length === 6, 'Orchestrator registers 6 fallback engines', `Registered: ${engines.length}`);
+  assert(engines.length === 7, 'Orchestrator registers 7 fallback engines', `Registered: ${engines.length}`);
 
   for (const eng of engines) {
     const avail = await eng.isAvailable();
@@ -1303,8 +1321,12 @@ live_51.ts
   assert(directPlan.category === 'DIRECT_M3U8', 'Route decision is DIRECT_M3U8');
   assert(directPlan.skipPlaywright === true, 'DIRECT_M3U8 explicitly sets skipPlaywright: true');
   assert(
-    directPlan.recommendedEngines[0].name.includes('FFmpeg'),
-    'Direct M3U8 prioritizes FFmpeg HLS engine first'
+    directPlan.recommendedEngines[0].name.includes('Aria2'),
+    'Direct M3U8 prioritizes Aria2 parallel engine first'
+  );
+  assert(
+    directPlan.recommendedEngines[1].name.includes('FFmpeg'),
+    'Direct M3U8 prioritizes FFmpeg engine second as reliable fallback'
   );
   assert(
     !directPlan.recommendedEngines.some(e => e.name.includes('Playwright')),
@@ -1371,7 +1393,180 @@ live_51.ts
   const replanned = planEngineRoute(discoveryTask, reg);
   assert(replanned.category === 'DIRECT_M3U8', 'Re-plans to DIRECT_M3U8 once manifest is discovered');
   assert(replanned.skipPlaywright === true, 'Bypasses Playwright once streamUrl is known');
-  assert(replanned.recommendedEngines[0].name.includes('FFmpeg'), 'Directs discovered stream straight to FFmpeg');
+  assert(replanned.recommendedEngines[0].name.includes('Aria2'), 'Directs discovered stream straight to Aria2');
+  assert(replanned.recommendedEngines[1].name.includes('FFmpeg'), 'Directs discovered stream to FFmpeg as fallback');
+
+  // TEST 25: URL Resolution Strengthening
+  console.log('\n--- 25. Testing URL Resolution Strengthening ---');
+  // User Requirement Example 1:
+  // https://cdn.example.com/hls/master.m3u8 containing 720/playlist.m3u8
+  // MUST resolve to https://cdn.example.com/hls/720/playlist.m3u8
+  // NOT https://cdn.example.com/720/playlist.m3u8
+  const resolvedVariant = resolveHlsUri('720/playlist.m3u8', 'https://cdn.example.com/hls/master.m3u8');
+  assert(
+    resolvedVariant === 'https://cdn.example.com/hls/720/playlist.m3u8',
+    'Resolve relative path with folder preserving playlist parent directory',
+    resolvedVariant
+  );
+
+  // User Requirement Example 2:
+  // segment.ts?token=abc&expires=123 MUST preserve query/token
+  const resolvedWithQuery = resolveHlsUri('segment.ts?token=abc&expires=123', 'https://cdn.example.com/hls/720/playlist.m3u8');
+  assert(
+    resolvedWithQuery === 'https://cdn.example.com/hls/720/segment.ts?token=abc&expires=123',
+    'Preserve existing segment query params and tokens',
+    resolvedWithQuery
+  );
+
+  // Relative segment inheriting token from signed media playlist URL
+  const resolvedWithParentToken = resolveSegmentAgainstMediaPlaylist(
+    'segment001.ts',
+    'https://cdn.example.com/hls/720/playlist.m3u8?token=secret123&exp=1800000000'
+  );
+  assert(
+    resolvedWithParentToken === 'https://cdn.example.com/hls/720/segment001.ts?token=secret123&exp=1800000000',
+    'Inherit signed tokens from media playlist if segment lacks query params',
+    resolvedWithParentToken
+  );
+
+  // Absolute paths relative to domain root
+  const rootRelative = resolveHlsUri('/streams/segment.ts', 'https://cdn.example.com/hls/master.m3u8');
+  assert(
+    rootRelative === 'https://cdn.example.com/streams/segment.ts',
+    'Root-relative path resolves correctly to domain root',
+    rootRelative
+  );
+
+  // Deep relative paths with directory traversal ../
+  const deepRelative = resolveHlsUri('../other/segment.ts', 'https://cdn.example.com/hls/720/playlist.m3u8');
+  assert(
+    deepRelative === 'https://cdn.example.com/hls/other/segment.ts',
+    'Directory traversal ../ resolves correctly',
+    deepRelative
+  );
+
+  // TEST 26: Signed URL & Token Refresh
+  console.log('\n--- 26. Testing Signed URL & Token Refresh ---');
+  // Detect various expiration keywords in query strings and errors
+  assert(isExpiredFailure(null, 'https://cdn.com/seg.ts?expires=1600000000'), 'Detect "expires" in query');
+  assert(isExpiredFailure(null, 'https://cdn.com/seg.ts?expire=1600000000'), 'Detect "expire" in query');
+  assert(isExpiredFailure(null, 'https://cdn.com/seg.ts?exp=1600000000'), 'Detect "exp" in query');
+  assert(isExpiredFailure(null, 'https://cdn.com/seg.ts?expires_at=1600000000'), 'Detect "expires_at" in query');
+  assert(isExpiredFailure(new Error('HTTP 401 Unauthorized')), 'Detect HTTP 401 error');
+  assert(isExpiredFailure(new Error('HTTP 403 Forbidden')), 'Detect HTTP 403 error');
+  assert(isExpiredFailure(new Error('expired signature returned by cdn')), 'Detect "expired signature"');
+  assert(isExpiredFailure(new Error('forbidden segment request: access denied')), 'Detect "forbidden segment"');
+  assert(isExpiredFailure(new Error('manifest expired, refresh required')), 'Detect "manifest expired"');
+  assert(isExpiredFailure(new Error('segment expired before download finished')), 'Detect "segment expired"');
+  assert(isExpiredFailure(new Error('token timestamp has elapsed')), 'Detect "token timestamp"');
+
+  // Token refresh workflow simulation
+  const refreshTask: DownloadTask = {
+    id: 'test-refresh-task',
+    chatId: 1001,
+    messageId: 301,
+    originalUrl: 'https://cdn.example.com/hls/master.m3u8',
+    streamUrl: 'https://cdn.example.com/hls/720/playlist.m3u8?exp=1500000000',
+    status: 'downloading',
+    failedEngines: [],
+    subprocesses: [],
+    abortController: new AbortController(),
+    tempDir: config.tempDir,
+    startTime: Date.now(),
+  };
+
+  // Test refreshing with an unreachable URL gracefully returns null without hanging or throwing
+  const refreshed = await refreshStreamManifest(refreshTask, 'https://cdn.example.com/hls/720/playlist.m3u8', 1000);
+  assert(refreshed === null, 'refreshStreamManifest handles failed network fetch safely');
+
+  // Verify that isExpiredFailure identifies all token expiration permutations
+  assert(isExpiredFailure(new Error('HTTP 401: Token expired')), 'isExpiredFailure flags 401');
+  assert(isExpiredFailure(new Error('HTTP 403: Signature forbidden')), 'isExpiredFailure flags 403');
+  assert(isExpiredFailure(null, 'https://cdn.example.com/seg.ts?expires=1600000000'), 'isExpiredFailure flags expired query param');
+
+  // TEST 27: Header Propagation
+  console.log('\n--- 27. Testing Header Propagation Across Engines ---');
+  const inputHeaders = {
+    'User-Agent': 'CustomBot/2.0 (Mobile)',
+    Referer: 'https://player.example.com/embed/123',
+    Origin: 'https://player.example.com',
+    Authorization: 'Bearer token-secret-xyz',
+    Cookie: 'session=12345; user=tester',
+    Accept: 'application/vnd.apple.mpegurl,*/*',
+    'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'cross-site',
+    'X-Custom-Client': 'TelegramUserbot',
+  };
+
+  const propagated = buildPropagatedHeaders(inputHeaders, undefined, {
+    targetUrl: 'https://cdn.example.com/hls/segment0.ts',
+  });
+
+  assert(propagated['User-Agent'] === 'CustomBot/2.0 (Mobile)', 'Propagates User-Agent');
+  assert(propagated['Referer'] === 'https://player.example.com/embed/123', 'Propagates Referer');
+  assert(propagated['Origin'] === 'https://player.example.com', 'Propagates Origin');
+  assert(propagated['Authorization'] === 'Bearer token-secret-xyz', 'Propagates Authorization');
+  assert(propagated['Cookie']?.includes('session=12345'), 'Propagates Cookie');
+  assert(propagated['Sec-Fetch-Dest'] === 'empty', 'Propagates Sec-Fetch-Dest');
+  assert(propagated['X-Custom-Client'] === 'TelegramUserbot', 'Propagates custom application headers');
+
+  // Aria2 headers format
+  const aria2Headers = buildAria2Headers(propagated);
+  assert(aria2Headers.some(h => h.startsWith('User-Agent:')), 'Aria2 header list contains User-Agent');
+  assert(aria2Headers.some(h => h.startsWith('Authorization:')), 'Aria2 header list contains Authorization');
+  assert(aria2Headers.some(h => h.startsWith('Referer:')), 'Aria2 header list contains Referer');
+
+  // FFmpeg CRLF header string format
+  const ffmpegHeaderString = buildFfmpegHeaderString(propagated);
+  assert(ffmpegHeaderString.includes('\r\n'), 'FFmpeg header string uses CRLF separator');
+  assert(ffmpegHeaderString.includes('User-Agent: CustomBot/2.0 (Mobile)'), 'FFmpeg headers include User-Agent');
+  assert(ffmpegHeaderString.includes('Authorization: Bearer token-secret-xyz'), 'FFmpeg headers include Authorization');
+
+  // yt-dlp header arguments format
+  const ytdlpHeaderArgs = buildYtdlpHeaderArgs(propagated);
+  assert(ytdlpHeaderArgs.includes('--add-header'), 'yt-dlp uses --add-header flags');
+  assert(ytdlpHeaderArgs.some(a => a.startsWith('User-Agent:')), 'yt-dlp includes User-Agent argument');
+
+  // Streamlink header arguments format
+  const streamlinkHeaderArgs = buildStreamlinkHeaderArgs(propagated);
+  assert(streamlinkHeaderArgs.includes('--http-header'), 'Streamlink uses --http-header flags');
+  assert(streamlinkHeaderArgs.some(a => a.startsWith('Referer=')), 'Streamlink includes Referer= argument');
+
+  // TEST 28: Aria2 Engine Integration & Suitability
+  console.log('\n--- 28. Testing Aria2 Engine Integration ---');
+  const aria2Available = isAria2Available();
+  assert(aria2Available === true, 'Aria2 binary is available and verified on system');
+
+  const aria2Engine = new Aria2Engine();
+  assert(aria2Engine.name === 'Aria2 Parallel Downloader', 'Aria2Engine name is Aria2 Parallel Downloader');
+
+  // Suitability checks:
+  // VOD with multiple segments -> Suitable
+  const vodManifest = parseMediaPlaylist(
+    '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg0.ts\n#EXTINF:6.0,\nseg1.ts\n#EXT-X-ENDLIST',
+    'https://cdn.example.com/hls/playlist.m3u8'
+  );
+  const isVodSuitable = aria2Engine.isSuitableForAria2(vodManifest, false);
+  assert(isVodSuitable.suitable === true, 'Aria2 suitability returns true for multi-segment VOD');
+
+  // Live stream -> NOT suitable for batch Aria2
+  const liveManifest = parseMediaPlaylist(
+    '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg0.ts\n#EXTINF:6.0,\nseg1.ts',
+    'https://cdn.example.com/hls/live.m3u8'
+  );
+  const isLiveSuitable = aria2Engine.isSuitableForAria2(liveManifest, false);
+  assert(isLiveSuitable.suitable === false, 'Aria2 rejects live streams to allow continuous stream engines');
+
+  // DRM encrypted stream -> NOT suitable
+  const isDrmSuitable = aria2Engine.isSuitableForAria2(vodManifest, true);
+  assert(isDrmSuitable.suitable === false, 'Aria2 rejects DRM protected streams');
+
+  // Registry count check (All 7 engines registered in orchestrator)
+  const allEngines = routerOrchestrator.getEngines();
+  assert(allEngines.length === 7, `Orchestrator has 7 engines registered (Direct, Playwright, Streamlink, yt-dlp, Aria2, FFmpeg, Retry): ${allEngines.map(e => e.name).join(', ')}`);
+  assert(allEngines.some(e => e.name.includes('Aria2')), 'Orchestrator engine list contains Aria2');
 
   // SUMMARY
   console.log('\n========================================================');

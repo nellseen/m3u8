@@ -5,6 +5,7 @@ import { PlaywrightEngine } from '../engines/playwright-engine.ts';
 import { StreamlinkEngine } from '../engines/streamlink-engine.ts';
 import { YtdlpEngine } from '../engines/ytdlp-engine.ts';
 import { FfmpegEngine } from '../engines/ffmpeg-engine.ts';
+import { Aria2Engine } from '../engines/aria2-engine.ts';
 import { RetryEngine } from '../engines/retry-engine.ts';
 import { DownloadTask } from '../types.ts';
 import { logger } from '../logger.ts';
@@ -110,6 +111,7 @@ export interface EngineRegistry {
   streamlink: StreamlinkEngine;
   ytdlp: YtdlpEngine;
   ffmpeg: FfmpegEngine;
+  aria2: Aria2Engine;
   retry: RetryEngine;
 }
 
@@ -127,16 +129,17 @@ export function planEngineRoute(
   // A. If a manifest is already identified directly or via earlier discovery:
   // ROUTE DIRECTLY TO M3U8 / FFMPEG PIPELINE. NEVER LAUNCH PLAYWRIGHT.
   if (hasDirectManifest) {
-    logger.info(`[Router] Direct M3U8 manifest confirmed for task ${task.id}. Prioritizing M3U8 Parser & FFmpeg pipeline (Playwright bypassed).`);
+    logger.info(`[Router] Direct M3U8 manifest confirmed for task ${task.id}. Prioritizing M3U8 Parser & Aria2/FFmpeg pipeline (Playwright bypassed).`);
     return {
       category: 'DIRECT_M3U8',
       reason: 'Direct M3U8 manifest available. Playwright/Chromium bypassed to eliminate overhead.',
       skipPlaywright: true,
       recommendedEngines: [
-        engines.ffmpeg,     // Priority 1: Direct HLS & FFmpeg segment assembly
-        engines.ytdlp,      // Priority 2: yt-dlp secondary HLS fetcher
-        engines.streamlink, // Priority 3: Streamlink fallback
-        engines.retry,      // Priority 4: Secondary retry
+        engines.aria2,      // Priority 1: Aria2 Parallel Multi-Connection Segment Downloader
+        engines.ffmpeg,     // Priority 2: Direct HLS & FFmpeg segment assembly
+        engines.ytdlp,      // Priority 3: yt-dlp secondary HLS fetcher
+        engines.streamlink, // Priority 4: Streamlink fallback
+        engines.retry,      // Priority 5: Secondary retry
       ],
     };
   }
@@ -148,9 +151,10 @@ export function planEngineRoute(
       logger.info(`[Router] Source classified as DIRECT_M3U8 (${activeUrl}). Bypassing Playwright/Chromium.`);
       return {
         category: 'DIRECT_M3U8',
-        reason: 'Direct M3U8 URL detected. Routing to HLS & FFmpeg pipeline directly.',
+        reason: 'Direct M3U8 URL detected. Routing to Aria2 & FFmpeg pipeline directly.',
         skipPlaywright: true,
         recommendedEngines: [
+          engines.aria2,
           engines.ffmpeg,
           engines.ytdlp,
           engines.streamlink,
@@ -166,6 +170,7 @@ export function planEngineRoute(
         skipPlaywright: true,
         recommendedEngines: [
           engines.direct,
+          engines.aria2,
           engines.ytdlp,
           engines.ffmpeg,
           engines.retry,
@@ -183,6 +188,7 @@ export function planEngineRoute(
           engines.ytdlp,
           engines.direct,
           engines.playwright,
+          engines.aria2,
           engines.ffmpeg,
           engines.retry,
         ],
@@ -198,6 +204,7 @@ export function planEngineRoute(
           engines.ytdlp,
           engines.direct,
           engines.playwright,
+          engines.aria2,
           engines.ffmpeg,
           engines.retry,
         ],
@@ -217,6 +224,7 @@ export function planEngineRoute(
         recommendedEngines: [
           engines.direct,
           engines.playwright,
+          engines.aria2,
           engines.ffmpeg,
           engines.ytdlp,
           engines.streamlink,

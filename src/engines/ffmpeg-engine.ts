@@ -12,36 +12,17 @@ import { isUrlExpired } from '../utils/signed-url.ts';
 import { normalizeCookies } from '../utils/cookie-manager.ts';
 import { logger } from '../logger.ts';
 
+import {
+  buildPropagatedHeaders,
+  buildFfmpegHeaderString,
+} from '../utils/header-propagator.ts';
+
 /**
  * Builds HTTP headers string for FFmpeg -headers argument
  * Strictly propagates only genuine source session headers & normalized cookies
  */
 export function buildFfmpegHeaders(headers?: Record<string, string>, cookies?: string): string {
-  const normCookies = normalizeCookies(cookies);
-  if (!headers && !normCookies) return '';
-
-  let headerStr = '';
-  const seenKeys = new Set<string>();
-
-  if (headers) {
-    for (const [key, value] of Object.entries(headers)) {
-      if (!value) continue;
-      const lowerKey = key.toLowerCase();
-      if (lowerKey === 'content-length' || lowerKey === 'host') continue; // Managed by network stack
-
-      if (!seenKeys.has(lowerKey)) {
-        seenKeys.add(lowerKey);
-        headerStr += `${key}: ${value}\r\n`;
-      }
-    }
-  }
-
-  // Ensure cookies are included if task has cookies but headers['cookie'] is absent
-  if (normCookies && !seenKeys.has('cookie')) {
-    headerStr += `Cookie: ${normCookies}\r\n`;
-  }
-
-  return headerStr;
+  return buildFfmpegHeaderString(headers, cookies);
 }
 
 export class FfmpegEngine extends BaseEngine {
@@ -67,19 +48,10 @@ export class FfmpegEngine extends BaseEngine {
   ): Promise<string | null> {
     try {
       if (url.startsWith('http://') || url.startsWith('https://')) {
-        const reqHeaders: Record<string, string> = {
-          'User-Agent':
-            headers?.['user-agent'] ||
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          Accept:
-            headers?.['accept'] ||
-            'application/vnd.apple.mpegurl,application/x-mpegURL,application/mpegurl,*/*;q=0.8',
-        };
-        if (headers?.['referer']) reqHeaders['Referer'] = headers['referer'];
-        if (headers?.['origin']) reqHeaders['Origin'] = headers['origin'];
-        if (headers?.['authorization']) reqHeaders['Authorization'] = headers['authorization'];
-        const normCookies = normalizeCookies(cookies || headers?.['cookie']);
-        if (normCookies) reqHeaders['Cookie'] = normCookies;
+        const reqHeaders = buildPropagatedHeaders(headers, cookies, {
+          targetUrl: url,
+          defaultUserAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        });
 
         const res = await fetch(url, { headers: reqHeaders, signal: AbortSignal.timeout(10000) });
         if (res.ok) {
@@ -257,15 +229,16 @@ export class FfmpegEngine extends BaseEngine {
       let stderr = '';
       const args: string[] = ['-y'];
 
+      const isHttp = (u?: string) => typeof u === 'string' && (u.startsWith('http://') || u.startsWith('https://'));
       args.push('-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data');
-      if (headerStr) {
+      if (headerStr && isHttp(videoUrl)) {
         args.push('-headers', headerStr);
       }
       args.push('-i', videoUrl);
 
       // If separated audio track is provided, add as second input
       if (audioUrl) {
-        if (headerStr) {
+        if (headerStr && isHttp(audioUrl)) {
           args.push('-headers', headerStr);
         }
         args.push('-i', audioUrl);
@@ -329,13 +302,13 @@ export class FfmpegEngine extends BaseEngine {
         // Transcoding fallback if stream copy failed
         logger.warn('FFmpeg copy failed, retrying with re-encode fallback...');
         const transcodeArgs: string[] = ['-y', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data'];
-        if (headerStr) {
+        if (headerStr && isHttp(videoUrl)) {
           transcodeArgs.push('-headers', headerStr);
         }
         transcodeArgs.push('-i', videoUrl);
 
         if (audioUrl) {
-          if (headerStr) {
+          if (headerStr && isHttp(audioUrl)) {
             transcodeArgs.push('-headers', headerStr);
           }
           transcodeArgs.push('-i', audioUrl);
@@ -381,6 +354,9 @@ export class FfmpegEngine extends BaseEngine {
 
           let errorType: any = 'FFMPEG_ERROR';
           const lower = errMsg.toLowerCase();
+          const errWithoutBanner = errMsg.replace(/ffmpeg version[\s\S]*?built with[^\n]*/i, '');
+          const lowerWithoutBanner = errWithoutBanner.toLowerCase();
+
           if (
             lower.includes('403 forbidden') ||
             lower.includes('401 unauthorized') ||
@@ -390,7 +366,11 @@ export class FfmpegEngine extends BaseEngine {
             errorType = 'EXPIRED_URL';
           } else if (lower.includes('404 not found') || lower.includes('server returned 404')) {
             errorType = 'NO_MEDIA_FOUND';
-          } else if (lower.includes('drm') || lower.includes('widevine') || lower.includes('fairplay')) {
+          } else if (
+            /\bdrm\b/i.test(errWithoutBanner) ||
+            lowerWithoutBanner.includes('widevine') ||
+            lowerWithoutBanner.includes('fairplay')
+          ) {
             errorType = 'DRM_PROTECTED';
           } else if (lower.includes('sample-aes')) {
             errorType = 'UNSUPPORTED_ENCRYPTION';

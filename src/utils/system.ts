@@ -94,6 +94,35 @@ export function getStreamlinkPath(): string {
   return 'streamlink';
 }
 
+export function getAria2Path(): string {
+  if (config.customPaths.aria2 && fs.existsSync(config.customPaths.aria2)) {
+    return config.customPaths.aria2;
+  }
+  if (isCommandAvailable('aria2c')) {
+    return 'aria2c';
+  }
+  if (fs.existsSync('/usr/bin/aria2c')) {
+    return '/usr/bin/aria2c';
+  }
+  if (fs.existsSync('/usr/local/bin/aria2c')) {
+    return '/usr/local/bin/aria2c';
+  }
+  return 'aria2c';
+}
+
+export function isAria2Available(): boolean {
+  try {
+    return (
+      isCommandAvailable('aria2c') ||
+      fs.existsSync('/usr/bin/aria2c') ||
+      fs.existsSync('/usr/local/bin/aria2c') ||
+      Boolean(config.customPaths.aria2 && fs.existsSync(config.customPaths.aria2))
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function formatBytes(bytes?: number): string {
   if (!bytes || bytes <= 0 || isNaN(bytes)) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];

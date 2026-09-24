@@ -22,7 +22,8 @@ import {
   selectTargetVariant,
 } from './m3u8-parser.ts';
 import { normalizeCookies } from './cookie-manager.ts';
-import { isUrlExpired, isSignedUrl } from './signed-url.ts';
+import { isUrlExpired, isSignedUrl, isExpiredFailure } from './signed-url.ts';
+import { buildPropagatedHeaders } from './header-propagator.ts';
 import { logger } from '../logger.ts';
 
 export interface SegmentValidationOptions {
@@ -53,22 +54,11 @@ function buildRequestHeaders(
   cookies?: string,
   rangeBytes?: string
 ): Record<string, string> {
-  const reqHeaders: Record<string, string> = {
-    'User-Agent':
+  const reqHeaders = buildPropagatedHeaders(headers, cookies, {
+    defaultUserAgent:
       headers?.['user-agent'] ||
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    Accept:
-      headers?.['accept'] ||
-      '*/*',
-    'Accept-Language': headers?.['accept-language'] || 'en-US,en;q=0.9',
-  };
-
-  if (headers?.['referer']) reqHeaders['Referer'] = headers['referer'];
-  if (headers?.['origin']) reqHeaders['Origin'] = headers['origin'];
-  if (headers?.['authorization']) reqHeaders['Authorization'] = headers['authorization'];
-
-  const normCookies = normalizeCookies(cookies || headers?.['cookie']);
-  if (normCookies) reqHeaders['Cookie'] = normCookies;
+  });
 
   if (rangeBytes) {
     reqHeaders['Range'] = rangeBytes;

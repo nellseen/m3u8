@@ -102,12 +102,21 @@ export type HlsParseResult = MasterPlaylistParseResult | MediaPlaylistParseResul
 
 /**
  * Resolves an HLS URI (relative or absolute) against a manifest base URL.
- * Intelligently preserves and propagates query parameters (tokens, signatures, auth)
- * from signed parent URLs when relative URIs do not carry their own query parameters.
+ * Intelligently preserves and propagates query parameters (tokens, signatures, auth, expires)
+ * from parent URLs while strictly preserving any segment-specific query parameters.
+ *
+ * Example:
+ *   baseUrl:  https://cdn.example.com/hls/master.m3u8
+ *   cleanUri: 720/playlist.m3u8
+ *   Result:   https://cdn.example.com/hls/720/playlist.m3u8 (NOT https://cdn.example.com/720/playlist.m3u8)
+ *
+ *   cleanUri: segment.ts?token=abc&expires=123
+ *   Result preserves token=abc and expires=123
  */
 export function resolveHlsUri(uri: string, baseUrl?: string, preserveSignedParams = true): string {
   if (!uri || typeof uri !== 'string') return '';
   const cleanUri = uri.trim().replace(/^['"`]|['"`]$/g, '').replace(/\\/g, '');
+  if (!cleanUri) return '';
 
   if (!baseUrl) {
     const normalized = normalizeMediaUrl(cleanUri);
@@ -119,22 +128,34 @@ export function resolveHlsUri(uri: string, baseUrl?: string, preserveSignedParam
     return `https:${cleanUri}`;
   }
 
+  // Ensure base URL directory path is properly formatted
+  let normalizedBase = baseUrl.trim();
+  try {
+    const baseObj = new URL(normalizedBase);
+    // If base pathname does not end with a slash and does not have a dot-extension,
+    // ensure it is treated as a directory so relative paths do not strip the last path component
+    const lastPart = baseObj.pathname.split('/').pop() || '';
+    if (!baseObj.pathname.endsWith('/') && !lastPart.includes('.')) {
+      baseObj.pathname = `${baseObj.pathname}/`;
+      normalizedBase = baseObj.href;
+    }
+  } catch {}
+
   let resolved: URL;
   try {
-    resolved = new URL(cleanUri, baseUrl);
+    resolved = new URL(cleanUri, normalizedBase);
   } catch {
-    const fallback = normalizeMediaUrl(cleanUri, baseUrl);
+    const fallback = normalizeMediaUrl(cleanUri, normalizedBase);
     return fallback || cleanUri;
   }
 
-  // Check if baseUrl carries signed URL tokens / security parameters
+  // Propagate query parameters from baseUrl if enabled
   if (preserveSignedParams && baseUrl.includes('?')) {
     try {
       const baseParsed = new URL(baseUrl);
-      // If the target segment does not already have authentication/token params,
-      // propagate search parameters from parent playlist
-      if (baseParsed.search && isSignedUrl(baseUrl)) {
+      if (baseParsed.search) {
         for (const [key, value] of baseParsed.searchParams.entries()) {
+          // Do not overwrite parameters that the segment already defines
           if (!resolved.searchParams.has(key)) {
             resolved.searchParams.set(key, value);
           }
@@ -144,6 +165,19 @@ export function resolveHlsUri(uri: string, baseUrl?: string, preserveSignedParam
   }
 
   return resolved.href;
+}
+
+/**
+ * Resolves a segment URI strictly against its containing Media Playlist URL.
+ * Guarantees that segment paths are resolved relative to the actual variant playlist,
+ * not the parent master playlist.
+ */
+export function resolveSegmentAgainstMediaPlaylist(
+  segmentUri: string,
+  mediaPlaylistUrl: string,
+  preserveParams = true
+): string {
+  return resolveHlsUri(segmentUri, mediaPlaylistUrl, preserveParams);
 }
 
 /**

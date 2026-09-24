@@ -209,6 +209,20 @@ else
   fi
 fi
 
+# 5b. Check and install aria2
+log_info "Checking aria2 parallel downloader..."
+if command -v aria2c >/dev/null 2>&1; then
+  log_ok "aria2c available: $(aria2c -v 2>/dev/null | head -n 1)"
+else
+  log_info "Installing aria2..."
+  pkg_install aria2 2>/dev/null || true
+  if command -v aria2c >/dev/null 2>&1; then
+    log_ok "aria2c installed successfully."
+  else
+    log_warn "aria2 installation skipped; other engines will be used."
+  fi
+fi
+
 # 6. Install Node project dependencies via pnpm (with auto-approval for native builds)
 log_info "Configuring pnpm build approvals (bypassing ERR_PNPM_IGNORED_BUILDS)..."
 pnpm approve-builds --all 2>/dev/null || true

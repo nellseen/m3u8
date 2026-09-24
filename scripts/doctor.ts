@@ -8,6 +8,7 @@ import {
   getFfprobePath,
   getYtdlpPath,
   getStreamlinkPath,
+  getAria2Path,
   isTermuxOrPRoot,
   getAvailableDiskSpace,
   formatBytes,
@@ -61,6 +62,7 @@ async function runDoctor() {
     'Streamlink': { status: 'NOT READY' },
     'yt-dlp': { status: 'NOT READY' },
     'FFmpeg': { status: 'NOT READY' },
+    'aria2': { status: 'NOT READY' },
     'Telegram': { status: 'WARNING', note: 'SESSION MISSING' },
   };
 
@@ -175,6 +177,23 @@ async function runDoctor() {
       warn: true,
       details: 'streamlink not found in PATH',
       remedy: 'Install Streamlink: run "pip3 install --break-system-packages streamlink" or "bash scripts/setup.sh"',
+    };
+  });
+
+  // 6b. aria2
+  check('Binaries', 'aria2 Parallel Downloader', () => {
+    const bin = getAria2Path();
+    const out = getCommandOutput(`"${bin}" --version`);
+    if (out) {
+      readyStatus['aria2'].status = 'READY';
+      const firstLine = out.split('\n')[0];
+      return { pass: true, details: `${bin} (${firstLine})` };
+    }
+    return {
+      pass: true,
+      warn: true,
+      details: 'aria2c not found in PATH',
+      remedy: 'Install aria2: run "apt-get install -y aria2" or "pkg install aria2"',
     };
   });
 
