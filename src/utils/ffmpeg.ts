@@ -162,175 +162,39 @@ export async function validateMediaFile(
 }
 
 /**
- * Determines whether a media stream can be copied/remuxed directly without re-encoding
+ * Determines whether a media stream can be copied/remuxed directly without re-encoding.
+ * Strictly avoids any downscaling or transcoding. All resolutions (360p, 720p, 1080p, 1440p, 4K, etc.)
+ * are preserved natively.
  */
 export function isCompatibleForCopy(meta: MediaMetadata): boolean {
   if (!meta.hasVideo) return false;
-
-  const height = meta.height || 0;
-  const width = meta.width || 0;
-
-  // If resolution exceeds 720p, it must be downscaled (transcoding required)
-  if (height > 720 || (width > 1280 && width > height)) {
-    return false;
-  }
-
-  // Compatible video codecs for Telegram MP4 streaming without transcoding
-  const videoCodec = (meta.videoCodec || '').toLowerCase();
-  const isVideoCompatible =
-    videoCodec === 'h264' ||
-    videoCodec === 'avc1' ||
-    videoCodec === 'hevc' ||
-    videoCodec === 'h265' ||
-    videoCodec === 'vp9';
-
-  if (!isVideoCompatible) return false;
-
-  // Compatible audio codecs
-  if (meta.hasAudio) {
-    const audioCodec = (meta.audioCodec || '').toLowerCase();
-    const isAudioCompatible =
-      audioCodec === 'aac' ||
-      audioCodec === 'mp3' ||
-      audioCodec === 'opus' ||
-      audioCodec === 'ac3' ||
-      audioCodec === 'eac3';
-    if (!isAudioCompatible) return false;
-  }
-
   return true;
 }
 
 /**
- * Enforces maximum 720p resolution without upscaling, preserving aspect ratio.
- * Optimization:
- * - Prioritizes copy/remux without transcoding if media is compatible.
- * - Transcoding only when required (downscale or incompatible codecs).
- * - Target resolution: max 720p (360p stays 360p, 480p stays 480p, 720p stays 720p, 1080p downscaled to 720p).
- * - Never upscales smaller videos.
+ * Prepares video for Telegram using PURE STREAM COPY (-c copy).
+ * Transcoding, re-encoding, and downscaling (e.g. 1080p -> 720p) are completely eliminated.
+ * Preserves the exact source resolution and codecs natively without touching video frames.
  */
 export async function enforceMax720p(
   inputPath: string,
   outputPath: string,
   onProgress?: (progressText: string, percent?: number) => void
-): Promise<{ outputPath: string; meta: MediaMetadata; processingMode: 'copy_remux' | 'transcode' }> {
+): Promise<{ outputPath: string; meta: MediaMetadata; processingMode: 'copy_remux' }> {
   const initialMeta = await probeMedia(inputPath);
-  const ffmpegBin = getFfmpegPath();
   const height = initialMeta.height || 0;
   const width = initialMeta.width || 0;
 
-  // Target resolution: maximum 720p
-  // Check if downscale is required (height > 720 or wide landscape > 1280)
-  const requiresDownscale = height > 720 || (width > 1280 && width > height);
+  onProgress?.(`⚙️ Preserving native source resolution (${width}x${height}, direct stream copy)...`, 85);
+  logger.info(`[FFmpeg] Processing video with native resolution (${width}x${height}). Direct stream copy only (no downscale, no transcode).`);
 
-  if (requiresDownscale) {
-    onProgress?.(`📐 Limiting resolution to max 720p (Source: ${width}x${height} -> 720p max)...`, 85);
-    logger.info(`Downscaling video from ${width}x${height} to max 720p (no upscale)...`);
-
-    // Aspect-ratio safe downscaling: ensures ih never exceeds 720 and iw is even
-    const filter = "scale=-2:'min(720,ih)'";
-
-    await new Promise<void>((resolve, reject) => {
-      // Prioritize copying audio stream while transcoding video
-      const proc = spawn(
-        ffmpegBin,
-        [
-          '-y',
-          '-i',
-          inputPath,
-          '-vf',
-          filter,
-          '-c:v',
-          'libx264',
-          '-preset',
-          'veryfast',
-          '-crf',
-          '23',
-          '-c:a',
-          'copy',
-          '-movflags',
-          '+faststart',
-          outputPath,
-        ],
-        { stdio: ['ignore', 'ignore', 'pipe'] }
-      );
-
-      let stderr = '';
-      proc.stderr.on('data', chunk => {
-        const text = chunk.toString();
-        stderr += text;
-        const timeMatch = text.match(/time=(\d+:\d+:\d+\.\d+)/);
-        if (timeMatch && onProgress) {
-          onProgress(`📐 Downscaling to 720p: ${timeMatch[1]}`, 90);
-        }
-      });
-
-      proc.on('close', code => {
-        if (code === 0 && fs.existsSync(outputPath)) {
-          resolve();
-        } else {
-          // If audio copy failed during downscale, retry with AAC audio re-encode
-          logger.warn('Audio copy during 720p scale failed, retrying with AAC re-encode');
-          const retryProc = spawn(
-            ffmpegBin,
-            [
-              '-y',
-              '-i',
-              inputPath,
-              '-vf',
-              filter,
-              '-c:v',
-              'libx264',
-              '-preset',
-              'veryfast',
-              '-crf',
-              '23',
-              '-c:a',
-              'aac',
-              '-b:a',
-              '128k',
-              '-movflags',
-              '+faststart',
-              outputPath,
-            ],
-            { stdio: 'ignore' }
-          );
-
-          retryProc.on('close', c => {
-            if (c === 0 && fs.existsSync(outputPath)) {
-              resolve();
-            } else {
-              reject(new Error(`FFmpeg 720p downscaling failed: ${stderr.slice(-300)}`));
-            }
-          });
-          retryProc.on('error', reject);
-        }
-      });
-
-      proc.on('error', reject);
-    });
-
-    const finalMeta = await probeMedia(outputPath);
-    return { outputPath, meta: finalMeta, processingMode: 'transcode' };
-  }
-
-  // Native <= 720p: DO NOT upscale! Maintain native resolution (360p -> 360p, 480p -> 480p, 720p -> 720p)
-  onProgress?.(`⚙️ Maintaining native resolution (${width}x${height} <= 720p, zero upscaling)...`, 85);
-  logger.info(`Video is already <= 720p (${width}x${height}). Prioritizing fast copy/remux without transcoding.`);
-
-  // Check if compatible for fast copy/remux
-  const canCopy = isCompatibleForCopy(initialMeta);
-  if (canCopy) {
-    logger.info(`[FFmpeg] Media format (${initialMeta.videoCodec}/${initialMeta.audioCodec || 'none'}) is compatible. Performing fast stream copy/remux.`);
-  }
-
-  // Fast copy or remux to Telegram MP4 (tries -c copy first, falls back to re-encode only if needed)
+  // Fast stream copy remux to Telegram MP4 (-c copy -movflags +faststart)
   await remuxToTelegramMp4(inputPath, outputPath, text => {
     onProgress?.(text, 88);
   });
 
   const finalMeta = await probeMedia(outputPath);
-  return { outputPath, meta: finalMeta, processingMode: canCopy ? 'copy_remux' : 'transcode' };
+  return { outputPath, meta: finalMeta, processingMode: 'copy_remux' };
 }
 
 /**
@@ -590,35 +454,9 @@ export async function remuxToTelegramMp4(
       if (code === 0 && fs.existsSync(outputPath)) {
         resolve(true);
       } else {
-        logger.warn('Fast copy remux failed, attempting transcode to MP4:', stderr.slice(-200));
-        // Fallback: re-encode video to h264 + aac
-        const reencode = spawn(
-          ffmpegBin,
-          [
-            '-y',
-            '-i',
-            inputPath,
-            '-c:v',
-            'libx264',
-            '-preset',
-            'veryfast',
-            '-crf',
-            '23',
-            '-c:a',
-            'aac',
-            '-b:a',
-            '128k',
-            '-movflags',
-            '+faststart',
-            outputPath,
-          ],
-          { stdio: 'ignore' }
-        );
-
-        reencode.on('close', c => {
-          resolve(c === 0 && fs.existsSync(outputPath));
-        });
-        reencode.on('error', err => reject(err));
+        const errMsg = stderr || `FFmpeg copy remux failed with code ${code}`;
+        logger.error(`Stream copy remux failed: ${errMsg.slice(-200)}. Video transcoding/re-encoding is strictly disabled.`);
+        reject(new Error(`Stream copy remux failed: ${errMsg.slice(-200)}`));
       }
     });
 

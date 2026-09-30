@@ -76,14 +76,10 @@ export class RetryEngine extends BaseEngine {
           args.push(
             '-i',
             candidateUrl,
-            '-c:v',
-            'libx264',
-            '-preset',
-            'veryfast',
-            '-crf',
-            '23',
-            '-c:a',
-            'aac',
+            '-c',
+            'copy',
+            '-bsf:a',
+            'aac_adtstoasc',
             '-movflags',
             '+faststart',
             outputPath

@@ -5,7 +5,8 @@ import { DownloadTask, DownloadStatus, TelegramUploadResult } from '../types.ts'
 import { config } from '../config.ts';
 import { FallbackOrchestrator } from '../engines/orchestrator.ts';
 import { createTaskDirectories, cleanupTaskTemp, killTaskProcesses, ensureDirectories } from '../utils/cleaner.ts';
-import { enforceMax720p, resolveVideoThumbnail, probeMedia } from '../utils/ffmpeg.ts';
+import { enforceMax720p, resolveVideoThumbnail, probeMedia, remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
+import { resolveNativeVideoVariant } from '../utils/variant-resolver.ts';
 import { getAvailableDiskSpace } from '../utils/system.ts';
 import { logger } from '../logger.ts';
 import { createJobFingerprint, normalizeUrlForFingerprint } from '../utils/fingerprint.ts';
@@ -310,7 +311,25 @@ export class DownloadQueue {
 
     try {
       task.status = 'detecting_url';
-      broadcastProgress('🔎 Detecting source...', 5);
+      broadcastProgress('Resolving video variants...', 5);
+
+      // 1. Native Variant Selection (multi=, master M3U8, direct MP4 patterns)
+      const inputUrl = task.streamUrl || task.originalUrl;
+      try {
+        const resolution = await resolveNativeVideoVariant(inputUrl, {
+          headers: task.streamHeaders,
+          cookies: task.cookies,
+          onProgress: (text, pct) => broadcastProgress(text, pct),
+        });
+
+        if (resolution.selectedVariant) {
+          task.selectedVariant = resolution.selectedVariant;
+          task.streamUrl = resolution.selectedVariant.url;
+          broadcastProgress(`Downloading ${resolution.selectedVariant.label}...`, 15);
+        }
+      } catch (err: any) {
+        logger.warn(`[Queue] Native variant resolution warning: ${err.message || err}. Proceeding with original URL.`);
+      }
 
       // Execute fallback chain
       const result = await this.orchestrator.executeWithFallback(
@@ -324,25 +343,30 @@ export class DownloadQueue {
 
       if (result.success && result.outputPath && fs.existsSync(result.outputPath)) {
         task.status = 'processing';
-        broadcastProgress('⚙️ Processing...', 80);
+        broadcastProgress('Processing...', 80);
 
-        // 2. Enforce Max 720p (Aspect-ratio safe downscaling, NO upscaling if <= 720p, copy/remux priority)
-        const processedFile = path.join(task.subDirs?.processed || task.tempDir, `processed_${task.id}.mp4`);
-        const { outputPath: compliantVideoPath, meta: finalMeta, processingMode } = await enforceMax720p(
-          result.outputPath,
-          processedFile,
-          (text, percent) => broadcastProgress(text, percent)
-        );
-        logger.ffmpeg(`[FFMPEG] Task ${task.id} processed via '${processingMode}' (Resolution: ${finalMeta.width}x${finalMeta.height})`);
-
-        // Store final compliant video inside task workspace dedicated 'final' directory
-        const workspaceFinalVideo = path.join(task.subDirs?.final || task.tempDir, `final_${task.id}.mp4`);
-        fs.copyFileSync(compliantVideoPath, workspaceFinalVideo);
-
-        // Copy final compliant file to permanent output directory for Telegram upload
+        // 2. Output handling: Native format preserved, duplicate file copies eliminated (Requirement 14, 15, 19)
         const permanentVideoPath = path.join(config.outputDir, `video_${task.id}.mp4`);
-        fs.copyFileSync(workspaceFinalVideo, permanentVideoPath);
+        const initialMeta = await probeMedia(result.outputPath);
+        const isMp4 = (initialMeta.container || '').toLowerCase().includes('mp4');
+
+        if (isMp4 && result.outputPath !== permanentVideoPath) {
+          // Direct atomic move / single copy to final destination without duplicate copies
+          try {
+            fs.renameSync(result.outputPath, permanentVideoPath);
+          } catch {
+            fs.copyFileSync(result.outputPath, permanentVideoPath);
+            try { fs.unlinkSync(result.outputPath); } catch {}
+          }
+        } else if (result.outputPath !== permanentVideoPath) {
+          // Necessary container packaging via pure stream copy (-c copy, no transcoding)
+          await remuxToTelegramMp4(result.outputPath, permanentVideoPath, text => broadcastProgress(text, 85));
+          try { fs.unlinkSync(result.outputPath); } catch {}
+        }
+
         task.outputPath = permanentVideoPath;
+        const finalMeta = await probeMedia(permanentVideoPath);
+        logger.info(`[Queue] Video ready at ${permanentVideoPath} (${finalMeta.width}x${finalMeta.height}, ${finalMeta.videoCodec || 'native'})`);
 
         // Populate task media details
         task.duration = finalMeta.duration;

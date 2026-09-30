@@ -299,103 +299,44 @@ export class FfmpegEngine extends BaseEngine {
           }
         }
 
-        // Transcoding fallback if stream copy failed
-        logger.warn('FFmpeg copy failed, retrying with re-encode fallback...');
-        const transcodeArgs: string[] = ['-y', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data'];
-        if (headerStr && isHttp(videoUrl)) {
-          transcodeArgs.push('-headers', headerStr);
-        }
-        transcodeArgs.push('-i', videoUrl);
+        // Stream copy failed - Transcoding/re-encoding fallback is strictly disabled
+        const errMsg = stderr || `FFmpeg stream copy failed with exit code ${code}`;
+        logger.warn(`FFmpeg engine stream copy failed: ${errMsg.slice(-250)}`);
 
-        if (audioUrl) {
-          if (headerStr && isHttp(audioUrl)) {
-            transcodeArgs.push('-headers', headerStr);
-          }
-          transcodeArgs.push('-i', audioUrl);
-          transcodeArgs.push(
-            '-map', '0:v:0',
-            '-map', '1:a:0',
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-c:a', 'aac',
-            '-movflags', '+faststart',
-            outputFile
-          );
-        } else {
-          transcodeArgs.push(
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-c:a', 'aac',
-            '-movflags', '+faststart',
-            outputFile
-          );
+        let errorType: any = 'FFMPEG_ERROR';
+        const lower = errMsg.toLowerCase();
+        const errWithoutBanner = errMsg.replace(/ffmpeg version[\s\S]*?built with[^\n]*/i, '');
+        const lowerWithoutBanner = errWithoutBanner.toLowerCase();
+
+        if (
+          lower.includes('403 forbidden') ||
+          lower.includes('401 unauthorized') ||
+          lower.includes('server returned 403') ||
+          lower.includes('server returned 401')
+        ) {
+          errorType = 'EXPIRED_URL';
+        } else if (lower.includes('404 not found') || lower.includes('server returned 404')) {
+          errorType = 'NO_MEDIA_FOUND';
+        } else if (
+          /\bdrm\b/i.test(errWithoutBanner) ||
+          lowerWithoutBanner.includes('widevine') ||
+          lowerWithoutBanner.includes('fairplay')
+        ) {
+          errorType = 'DRM_PROTECTED';
+        } else if (lower.includes('sample-aes')) {
+          errorType = 'UNSUPPORTED_ENCRYPTION';
+        } else if (lower.includes('connection reset') || lower.includes('econnreset') || lower.includes('server returned 5')) {
+          errorType = 'NETWORK_ERROR';
         }
 
-        const transcodeProc = spawn(ffmpegBin, transcodeArgs);
-        if (transcodeProc.pid) {
-          task.subprocesses.push(transcodeProc.pid);
-        }
-
-        transcodeProc.on('close', async c => {
-          if (c === 0 && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-            const validation = await validateMediaFile(outputFile);
-            if (validation.valid) {
-              resolve({
-                success: true,
-                outputPath: outputFile,
-                engineName: this.name,
-              });
-              return;
-            }
-          }
-
-          const errMsg = stderr || `FFmpeg failed with exit code ${code}`;
-          logger.warn(`FFmpeg engine failed: ${errMsg.slice(-250)}`);
-
-          let errorType: any = 'FFMPEG_ERROR';
-          const lower = errMsg.toLowerCase();
-          const errWithoutBanner = errMsg.replace(/ffmpeg version[\s\S]*?built with[^\n]*/i, '');
-          const lowerWithoutBanner = errWithoutBanner.toLowerCase();
-
-          if (
-            lower.includes('403 forbidden') ||
-            lower.includes('401 unauthorized') ||
-            lower.includes('server returned 403') ||
-            lower.includes('server returned 401')
-          ) {
-            errorType = 'EXPIRED_URL';
-          } else if (lower.includes('404 not found') || lower.includes('server returned 404')) {
-            errorType = 'NO_MEDIA_FOUND';
-          } else if (
-            /\bdrm\b/i.test(errWithoutBanner) ||
-            lowerWithoutBanner.includes('widevine') ||
-            lowerWithoutBanner.includes('fairplay')
-          ) {
-            errorType = 'DRM_PROTECTED';
-          } else if (lower.includes('sample-aes')) {
-            errorType = 'UNSUPPORTED_ENCRYPTION';
-          } else if (lower.includes('connection reset') || lower.includes('econnreset') || lower.includes('server returned 5')) {
-            errorType = 'NETWORK_ERROR';
-          }
-
-          resolve({
-            success: false,
-            engineName: this.name,
-            error: errMsg.slice(0, 300),
-            errorType,
-            details: {
-              isExpiredUrl: errorType === 'EXPIRED_URL',
-            },
-          });
-        });
-
-        transcodeProc.on('error', err => {
-          resolve({
-            success: false,
-            engineName: this.name,
-            error: `FFmpeg transcode error: ${err.message}`,
-            errorType: 'PROCESS_ERROR',
-          });
+        resolve({
+          success: false,
+          engineName: this.name,
+          error: errMsg.slice(0, 300),
+          errorType,
+          details: {
+            isExpiredUrl: errorType === 'EXPIRED_URL',
+          },
         });
       });
 

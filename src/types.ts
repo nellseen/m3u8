@@ -148,6 +148,13 @@ export interface DownloadTask {
   outputPath?: string;
   thumbnailPath?: string;
   metadata?: ExtractedMetadata;
+  selectedVariant?: {
+    width?: number;
+    height: number;
+    label: string;
+    url: string;
+    codec?: string;
+  };
   title?: string;
   duration?: number;
   width?: number;

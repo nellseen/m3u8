@@ -374,40 +374,25 @@ export class Aria2Engine extends BaseEngine {
     const concatLines = segmentsToDownload.map(s => `file '${path.join(segDir, s.filename)}'`);
     fs.writeFileSync(concatFile, concatLines.join('\n'), 'utf8');
 
-    // 12. Probe first segment to check resolution & codecs
-    const firstSegPath = path.join(segDir, segmentsToDownload[0].filename);
-    const probe = await probeMedia(firstSegPath);
-    const height = probe.height || 0;
-    const shouldDownscale = height > 720;
-
+    // 12. Concat & Remux via PURE Stream Copy (No downscale, no transcoding)
     const outputPath = path.join(task.tempDir, `aria2_output_${Date.now()}.mp4`);
-
-    const ffmpegArgs = ['-y', '-f', 'concat', '-safe', '0', '-i', concatFile];
-
-    if (shouldDownscale) {
-      logger.info(`[Aria2] Segment resolution (${probe.width}x${height}) exceeds 720p. Transcoding down to max 720p.`);
-      ffmpegArgs.push(
-        '-vf',
-        "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
-        '-c:v',
-        'libx264',
-        '-preset',
-        'veryfast',
-        '-crf',
-        '22',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '128k',
-        '-movflags',
-        '+faststart'
-      );
-    } else {
-      logger.info(`[Aria2] Segment resolution (${height}p) <= 720p. Remuxing with stream copy.`);
-      ffmpegArgs.push('-c', 'copy', '-movflags', '+faststart');
-    }
-
-    ffmpegArgs.push(outputPath);
+    logger.info(`[Aria2] Remuxing concatenated segments via pure stream copy (-c copy, no transcoding)...`);
+    const ffmpegArgs = [
+      '-y',
+      '-f',
+      'concat',
+      '-safe',
+      '0',
+      '-i',
+      concatFile,
+      '-c',
+      'copy',
+      '-bsf:a',
+      'aac_adtstoasc',
+      '-movflags',
+      '+faststart',
+      outputPath,
+    ];
 
     logger.info(`[Aria2] Merging segments: ${ffmpegBin} ${ffmpegArgs.join(' ')}`);
     const mergeResult = await new Promise<boolean>(resolve => {

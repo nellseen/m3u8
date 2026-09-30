@@ -39,6 +39,16 @@ import {
 import { Aria2Engine } from '../src/engines/aria2-engine.ts';
 import { isAria2Available } from '../src/utils/system.ts';
 import {
+  parseMultiParameter,
+  deriveMultiVariantUrls,
+  selectBestVariant,
+  resolveNativeVideoVariant,
+  detectUrlResolutionPattern,
+  generateDirectMp4Candidates,
+  extractVariantsFromMasterM3u8,
+  VideoVariant,
+} from '../src/utils/variant-resolver.ts';
+import {
   probeMedia,
   validateMediaFile,
   enforceMax720p,
@@ -362,8 +372,8 @@ async function runSelfAudit() {
   assert(requireAudioVal.valid === false, 'validateMediaFile rejects media missing audio when requireAudio is true');
   try { fs.unlinkSync(sampleVideoNoAudio); } catch {}
 
-  // TEST 7: Max 720p Resolution Policy (Downscaling >720p, NO Upscaling <=720p)
-  console.log('\n--- 7. Testing 720p Resolution Enforcement (Max 720p, No Upscaling) ---');
+  // TEST 7: Native Resolution Preservation Policy (NO Downscaling, NO Upscaling)
+  console.log('\n--- 7. Testing Native Resolution Preservation (Zero Downscaling / Upscaling) ---');
 
   // 7a. Native <= 720p must NOT be upscaled
   const nativeOutput = path.join(config.tempDir, `native_output_${Date.now()}.mp4`);
@@ -374,18 +384,18 @@ async function runSelfAudit() {
     `${nativeMeta.width}x${nativeMeta.height}`
   );
 
-  // 7b. High resolution (>720p) must be downscaled to max 720p preserving aspect ratio
+  // 7b. High resolution (1080p) must be preserved as native 1080p without downscaling
   execSync(
     `ffmpeg -y -f lavfi -i testsrc=duration=2:size=1920x1080:rate=30 -f lavfi -i sine=frequency=1000:duration=2 -c:v libx264 -c:a aac "${sampleVideo1080p}"`,
     { stdio: 'ignore' }
   );
   assert(fs.existsSync(sampleVideo1080p), 'Generated 1080p synthetic video via FFmpeg');
 
-  const downscaledOutput = path.join(config.tempDir, `downscaled_output_${Date.now()}.mp4`);
+  const downscaledOutput = path.join(config.tempDir, `native_1080p_output_${Date.now()}.mp4`);
   const { meta: downscaledMeta } = await enforceMax720p(sampleVideo1080p, downscaledOutput);
   assert(
-    downscaledMeta.height === 720 && downscaledMeta.width === 1280,
-    'Downscale 1080p to max 720p (1280x720) preserving aspect ratio',
+    downscaledMeta.height === 1080 && downscaledMeta.width === 1920,
+    '1080p preserved natively as 1080p (no downscaling)',
     `${downscaledMeta.width}x${downscaledMeta.height}`
   );
 
@@ -974,19 +984,16 @@ seg-002.mp4
     '360p H.264/AAC is compatible for copy/remux'
   );
   assert(
-    isCompatibleForCopy({ hasVideo: true, height: 1080, width: 1920, videoCodec: 'h264', audioCodec: 'aac' }) === false,
-    '1080p is not compatible for copy (must be downscaled to 720p)'
-  );
-  assert(
-    isCompatibleForCopy({ hasVideo: true, height: 720, width: 1280, videoCodec: 'mpeg2video', audioCodec: 'aac' }) === false,
-    'Incompatible video codec (mpeg2video) requires transcoding'
+    isCompatibleForCopy({ hasVideo: true, height: 1080, width: 1920, videoCodec: 'h264', audioCodec: 'aac' }) === true,
+    '1080p is compatible for direct copy without downscaling'
   );
 
   // 17.2 Resolution Policy:
+  // Native resolution preserved strictly without downscaling or upscaling:
   // 360p -> tetap 360p
   // 480p -> tetap 480p
   // 720p -> tetap 720p
-  // 1080p -> turun ke 720p
+  // 1080p -> tetap 1080p
   const ffmpegTestDir = path.join(config.tempDir, 'ffmpeg_opt_test');
   if (!fs.existsSync(ffmpegTestDir)) fs.mkdirSync(ffmpegTestDir, { recursive: true });
 
@@ -1019,14 +1026,14 @@ seg-002.mp4
   assert(res720.meta.height === 720, `720p maintains native resolution: height is ${res720.meta.height}`);
   assert(res720.processingMode === 'copy_remux', '720p prioritized copy/remux without unnecessary transcoding');
 
-  // D. Create test 1080p video (1920x1080) -> must downscale to 720p
+  // D. Create test 1080p video (1920x1080) -> must maintain native 1080p resolution (NO DOWNSCALE)
   const vid1080In = path.join(ffmpegTestDir, 'in_1080p.mp4');
   const vid1080Out = path.join(ffmpegTestDir, 'out_1080p.mp4');
   execSync(`"${ffmpegBin}" -y -f lavfi -i testsrc=duration=1:size=1920x1080:rate=10 -f lavfi -i sine=frequency=1000:duration=1 -c:v libx264 -c:a aac "${vid1080In}"`, { stdio: 'ignore' });
 
   const res1080 = await enforceMax720p(vid1080In, vid1080Out);
-  assert(res1080.meta.height === 720, `1080p downscaled to max 720p: height is ${res1080.meta.height}`);
-  assert(res1080.processingMode === 'transcode', '1080p transcoded for downscale');
+  assert(res1080.meta.height === 1080, `1080p maintains native resolution without downscale: height is ${res1080.meta.height}`);
+  assert(res1080.processingMode === 'copy_remux', '1080p processed via copy_remux without transcoding');
 
   // Clean test dir
   try {
@@ -1567,6 +1574,92 @@ live_51.ts
   const allEngines = routerOrchestrator.getEngines();
   assert(allEngines.length === 7, `Orchestrator has 7 engines registered (Direct, Playwright, Streamlink, yt-dlp, Aria2, FFmpeg, Retry): ${allEngines.map(e => e.name).join(', ')}`);
   assert(allEngines.some(e => e.name.includes('Aria2')), 'Orchestrator engine list contains Aria2');
+
+  // TEST 29: Universal Native Variant Selection & Zero-Transcoding Verification (Cases A - H)
+  console.log('\n--- 29. Testing Universal Native Variant Selection (Cases A - H) ---');
+
+  // CASE A: 144p, 240p, 480p, 720p, 1080p -> Expected: 720p
+  const variantsCaseA: VideoVariant[] = [
+    { height: 144, width: 256, label: '144p', url: 'http://cdn/144p.mp4', sourceType: 'url_pattern' },
+    { height: 240, width: 426, label: '240p', url: 'http://cdn/240p.mp4', sourceType: 'url_pattern' },
+    { height: 480, width: 854, label: '480p', url: 'http://cdn/480p.mp4', sourceType: 'url_pattern' },
+    { height: 720, width: 1280, label: '720p', url: 'http://cdn/720p.mp4', sourceType: 'url_pattern' },
+    { height: 1080, width: 1920, label: '1080p', url: 'http://cdn/1080p.mp4', sourceType: 'url_pattern' },
+  ];
+  const selectedCaseA = selectBestVariant(variantsCaseA, 720);
+  assert(selectedCaseA?.label === '720p' && selectedCaseA?.height === 720, 'CASE A: Selects 720p when 144p, 240p, 480p, 720p, 1080p available');
+
+  // CASE B: 144p, 240p, 480p, 1080p -> Expected: 480p
+  const variantsCaseB: VideoVariant[] = [
+    { height: 144, width: 256, label: '144p', url: 'http://cdn/144p.mp4', sourceType: 'url_pattern' },
+    { height: 240, width: 426, label: '240p', url: 'http://cdn/240p.mp4', sourceType: 'url_pattern' },
+    { height: 480, width: 854, label: '480p', url: 'http://cdn/480p.mp4', sourceType: 'url_pattern' },
+    { height: 1080, width: 1920, label: '1080p', url: 'http://cdn/1080p.mp4', sourceType: 'url_pattern' },
+  ];
+  const selectedCaseB = selectBestVariant(variantsCaseB, 720);
+  assert(selectedCaseB?.label === '480p' && selectedCaseB?.height === 480, 'CASE B: Selects 480p as fallback when 720p is not available');
+
+  // CASE C: 1080p only -> Expected: NO TRANSCODE (preserves 1080p native)
+  const variantsCaseC: VideoVariant[] = [
+    { height: 1080, width: 1920, label: '1080p', url: 'http://cdn/1080p.mp4', sourceType: 'url_pattern' },
+  ];
+  const selectedCaseC = selectBestVariant(variantsCaseC, 720);
+  assert(selectedCaseC?.label === '1080p' && selectedCaseC?.height === 1080, 'CASE C: 1080p only preserved natively with NO TRANSCODE');
+
+  // CASE D: 480p only -> Expected: 480p (NO UPSCALE)
+  const variantsCaseD: VideoVariant[] = [
+    { height: 480, width: 854, label: '480p', url: 'http://cdn/480p.mp4', sourceType: 'url_pattern' },
+  ];
+  const selectedCaseD = selectBestVariant(variantsCaseD, 720);
+  assert(selectedCaseD?.label === '480p' && selectedCaseD?.height === 480, 'CASE D: 480p only preserved natively with NO UPSCALE');
+
+  // CASE E: 360p, 480p, 720p, 1080p -> Expected: 720p
+  const variantsCaseE: VideoVariant[] = [
+    { height: 360, width: 640, label: '360p', url: 'http://cdn/360p.mp4', sourceType: 'url_pattern' },
+    { height: 480, width: 854, label: '480p', url: 'http://cdn/480p.mp4', sourceType: 'url_pattern' },
+    { height: 720, width: 1280, label: '720p', url: 'http://cdn/720p.mp4', sourceType: 'url_pattern' },
+    { height: 1080, width: 1920, label: '1080p', url: 'http://cdn/1080p.mp4', sourceType: 'url_pattern' },
+  ];
+  const selectedCaseE = selectBestVariant(variantsCaseE, 720);
+  assert(selectedCaseE?.label === '720p' && selectedCaseE?.height === 720, 'CASE E: Selects 720p when 360p, 480p, 720p, 1080p available');
+
+  // CASE F: Master M3U8: 1080p, 720p, 480p, 360p -> Expected: 720p variant playlist
+  const masterContent = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=854x480
+480p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+360p/index.m3u8`;
+  const m3u8Variants = extractVariantsFromMasterM3u8('https://cdn.example.com/hls/master.m3u8', masterContent);
+  assert(m3u8Variants.length === 4, 'CASE F: Successfully extracted 4 variants from Master M3U8');
+  const selectedCaseF = selectBestVariant(m3u8Variants, 720);
+  assert(
+    selectedCaseF?.label === '720p' && selectedCaseF?.url.includes('720p/index.m3u8'),
+    'CASE F: Master M3U8 selects 720p variant playlist directly without downloading 1080p'
+  );
+
+  // CASE G: URL using multi= parameter
+  const multiUrl = 'https://video-nss.cdnsolutions.media/Csr7bF1mi-iLTwMx61JIEw==,1781211600/media=hls4/multi=256x144:144p:,426x240:240p:,854x480:480p:,1280x720:720p:,1920x1080:1080p:/029/437/277/1080p.av1.mp4';
+  const parsedMulti = parseMultiParameter(multiUrl);
+  assert(parsedMulti.length === 5, 'CASE G: Parser successfully reads multi= parameter into 5 structured entries');
+  assert(parsedMulti.some(e => e.label === '720p' && e.width === 1280 && e.height === 720), 'CASE G: multi= contains 1280x720:720p');
+
+  const multiVariants = deriveMultiVariantUrls(multiUrl, parsedMulti);
+  assert(multiVariants.length === 5, 'CASE G: Derived 5 variant URLs from multi= URL');
+  const resolvedMulti = await resolveNativeVideoVariant(multiUrl, { skipNetworkValidation: true });
+  assert(resolvedMulti.selectedVariant.label === '720p', 'CASE G: Resolver automatically selects 720p from multi= URL');
+  assert(resolvedMulti.selectedVariant.url.includes('720p.av1.mp4'), `CASE G: URL formed correctly with 720p.av1.mp4: ${resolvedMulti.selectedVariant.url}`);
+
+  // CASE H: Direct URL: .../720p.av1.mp4 -> Expected: native AV1 preserved without re-encode
+  const directAv1Url = 'https://video-nss.cdnsolutions.media/029/437/277/720p.av1.mp4';
+  const patternDetected = detectUrlResolutionPattern(directAv1Url);
+  assert(patternDetected.height === 720, 'CASE H: Detected 720p pattern in direct AV1 MP4 URL');
+  const resolvedDirect = await resolveNativeVideoVariant(directAv1Url, { skipNetworkValidation: true });
+  assert(resolvedDirect.selectedVariant.label === '720p', 'CASE H: Resolves 720p native variant for direct AV1 MP4');
+  assert(resolvedDirect.selectedVariant.url === directAv1Url, 'CASE H: Preserves native URL without alteration or re-encode');
 
   // SUMMARY
   console.log('\n========================================================');
