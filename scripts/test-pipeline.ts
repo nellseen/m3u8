@@ -49,6 +49,14 @@ import {
   VideoVariant,
 } from '../src/utils/variant-resolver.ts';
 import {
+  inspectContentSignature,
+  cleanDiscoveredUrl,
+  isCandidateMediaUrl,
+  extractMediaCandidatesFromHtml,
+  rankCandidates,
+  DiscoveredCandidate,
+} from '../src/utils/media-discovery.ts';
+import {
   probeMedia,
   validateMediaFile,
   enforceMax720p,
@@ -1660,6 +1668,79 @@ live_51.ts
   const resolvedDirect = await resolveNativeVideoVariant(directAv1Url, { skipNetworkValidation: true });
   assert(resolvedDirect.selectedVariant.label === '720p', 'CASE H: Resolves 720p native variant for direct AV1 MP4');
   assert(resolvedDirect.selectedVariant.url === directAv1Url, 'CASE H: Preserves native URL without alteration or re-encode');
+
+  // TEST 30: Universal Media Discovery Pipeline & Content-Based Probing
+  console.log('\n--- 30. Testing Universal Media Discovery Pipeline ---');
+
+  // 30.1 Content-based detection (Requirement 4)
+  const masterSignature = inspectContentSignature('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n720.m3u8', 'application/vnd.apple.mpegurl');
+  assert(masterSignature.mediaType === 'HLS_MASTER' && masterSignature.isMaster === true, 'Content-based: Detects HLS Master from body signature');
+
+  const mediaSignature = inspectContentSignature('#EXTM3U\n#EXTINF:6.0,\nseg1.ts\n#EXT-X-ENDLIST', 'text/plain');
+  assert(mediaSignature.mediaType === 'HLS_MEDIA' && mediaSignature.isMaster === false, 'Content-based: Detects HLS Media even when Content-Type is text/plain');
+
+  const mp4Signature = inspectContentSignature('\x00\x00\x00\x18ftypmp42', 'application/octet-stream');
+  assert(mp4Signature.mediaType === 'DIRECT_VIDEO', 'Content-based: Detects MP4 video from binary signature');
+
+  // 30.2 Extension-agnostic candidate URL recognition (Requirement 3)
+  assert(isCandidateMediaUrl('https://example.com/master.m3u8'), 'Recognizes /master.m3u8');
+  assert(isCandidateMediaUrl('https://example.com/index'), 'Recognizes /index');
+  assert(isCandidateMediaUrl('https://example.com/index?id=abc'), 'Recognizes /index?id=abc');
+  assert(isCandidateMediaUrl('https://example.com/playlist'), 'Recognizes /playlist');
+  assert(isCandidateMediaUrl('https://example.com/manifest'), 'Recognizes /manifest');
+  assert(isCandidateMediaUrl('https://example.com/stream'), 'Recognizes /stream');
+  assert(isCandidateMediaUrl('https://example.com/video?id=123'), 'Recognizes /video?id=123');
+  assert(isCandidateMediaUrl('https://example.com/api/media/123'), 'Recognizes /api/media/123');
+  assert(isCandidateMediaUrl('https://example.com/abc/xyz?token=xxxx'), 'Recognizes /abc/xyz?token=xxxx');
+
+  // 30.3 URL Unescaping and normalization (Requirement 7)
+  const unescaped = cleanDiscoveredUrl('https:\\/\\/cdn.example.com\\/api\\/stream\\/master.m3u8', 'https://example.com');
+  assert(unescaped === 'https://cdn.example.com/api/stream/master.m3u8', 'Unescapes backslashes in discovered URLs');
+
+  const unicodeDecoded = cleanDiscoveredUrl('https://cdn.example.com\\u002Fhls\\u002Fplaylist.m3u8', 'https://example.com');
+  assert(unicodeDecoded === 'https://cdn.example.com/hls/playlist.m3u8', 'Unescapes unicode slashes in discovered URLs');
+
+  // 30.4 HTML, JS & Player extraction (Requirement 7)
+  const samplePageHtml = `
+    <html>
+      <head>
+        <title>Watch Movie 123</title>
+        <meta property="og:image" content="https://cdn.example.com/poster.jpg">
+      </head>
+      <body>
+        <div id="player-container">
+          <iframe src="/embed/player?vid=999"></iframe>
+        </div>
+        <script>
+          player({ source: "/api/stream/master.m3u8" });
+          const video = "https://cdn.example.com/index?token=secret123";
+          const config = {
+            sources: [
+              { file: "https://cdn.example.com/hls/720p.m3u8", label: "720p" }
+            ]
+          };
+        </script>
+      </body>
+    </html>
+  `;
+  const htmlDiscovery = extractMediaCandidatesFromHtml(samplePageHtml, 'https://example.com/watch/123');
+  assert(htmlDiscovery.candidates.length >= 3, `Extracted ${htmlDiscovery.candidates.length} candidates from HTML, JS and player configs`);
+  assert(htmlDiscovery.candidates.some(c => c.url.includes('/api/stream/master.m3u8')), 'Extracted candidate from player({ source: ... })');
+  assert(htmlDiscovery.candidates.some(c => c.url.includes('/index?token=secret123')), 'Extracted candidate from const video = ...');
+  assert(htmlDiscovery.candidates.some(c => c.url.includes('/hls/720p.m3u8')), 'Extracted candidate from sources: [{ file: ... }]');
+  assert(htmlDiscovery.iframesToFollow.some(i => i.includes('/embed/player')), 'Extracted player iframe target for discovery');
+
+  // 30.5 Candidate Ranking (Requirement 9)
+  const testCandidates: DiscoveredCandidate[] = [
+    { url: 'https://example.com/page.html', source: 'html_tag', discoveredAt: Date.now(), mediaType: 'UNKNOWN', rankScore: 5 },
+    { url: 'https://example.com/direct.mp4', source: 'html_tag', discoveredAt: Date.now(), mediaType: 'DIRECT_VIDEO', rankScore: 60 },
+    { url: 'https://example.com/master.m3u8', source: 'player_config', discoveredAt: Date.now(), mediaType: 'HLS_MASTER', rankScore: 160 },
+    { url: 'https://example.com/media.m3u8', source: 'network_xhr', discoveredAt: Date.now(), mediaType: 'HLS_MEDIA', rankScore: 80 },
+  ];
+  const rankedCandidates = rankCandidates(testCandidates);
+  assert(rankedCandidates[0].mediaType === 'HLS_MASTER', 'Candidate ranking: HLS Master ranked #1');
+  assert(rankedCandidates[1].mediaType === 'HLS_MEDIA', 'Candidate ranking: HLS Media ranked #2');
+  assert(rankedCandidates[2].mediaType === 'DIRECT_VIDEO', 'Candidate ranking: Direct MP4 ranked #3');
 
   // SUMMARY
   console.log('\n========================================================');

@@ -6,6 +6,7 @@ import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
 import { analyzeUrl, isHlsContentType, normalizeMediaUrl } from '../utils/url-extractor.ts';
 import { scanHtmlForM3u8AndMedia } from '../utils/m3u8-detector.ts';
+import { discoverMediaFromPage } from '../utils/media-discovery.ts';
 import { normalizeCookies, mergeCookieStrings } from '../utils/cookie-manager.ts';
 import { remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
 import { formatBytes } from '../utils/system.ts';
@@ -64,158 +65,72 @@ export class DirectEngine extends BaseEngine {
         }
       }
 
-      // 3. Web Page Inspection via Deep HTTP & HTML Analysis
-      onProgress?.('🌐 Inspecting page HTTP response & deep HTML for M3U8 playlists...', 10);
+      // 3. Universal Web Page Discovery via Deep HTML, Scripts, Player Configs & Iframes
+      onProgress?.('🌐 Scanning web page for embedded media & player configs...', 10);
       
-      const timeoutController = new AbortController();
-      const fetchTimer = setTimeout(() => timeoutController.abort(), 15000);
+      const discovery = await discoverMediaFromPage(targetUrl, {
+        headers: task.streamHeaders,
+        cookies: task.cookies,
+        onProgress: (text, pct) => onProgress?.(text, pct),
+      });
 
-      const abortHandler = () => timeoutController.abort();
-      task.abortController.signal.addEventListener('abort', abortHandler, { once: true });
-
-      const requestHeaders: Record<string, string> = {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,application/vnd.apple.mpegurl,application/x-mpegURL,application/mpegurl,video/*,*/*;q=0.8',
-        Referer: targetUrl,
-      };
-
-      try {
-        requestHeaders['Origin'] = new URL(targetUrl).origin;
-      } catch {}
-
-      let res: globalThis.Response;
-      try {
-        res = await fetch(targetUrl, {
-          headers: requestHeaders,
-          signal: timeoutController.signal,
-        });
-      } finally {
-        clearTimeout(fetchTimer);
-        task.abortController.signal.removeEventListener('abort', abortHandler);
+      // Forward session headers and cookies
+      if (discovery.sessionHeaders) {
+        task.streamHeaders = { ...task.streamHeaders, ...discovery.sessionHeaders };
+      }
+      if (discovery.cookies) {
+        task.cookies = mergeCookieStrings(task.cookies, discovery.cookies);
+      }
+      if (discovery.sourceThumbnail && (!task.metadata || !task.metadata.sourceThumbnail)) {
+        if (!task.metadata) task.metadata = {};
+        task.metadata.sourceThumbnail = discovery.sourceThumbnail;
+        if (!task.metadata.thumbnail) task.metadata.thumbnail = discovery.sourceThumbnail;
       }
 
-      // Capture Set-Cookie if any returned
-      const setCookie = res.headers.get('set-cookie');
-      if (setCookie) {
-        const normalized = normalizeCookies(setCookie);
-        task.cookies = mergeCookieStrings(task.cookies, normalized);
-      }
+      // If direct playable video was resolved (e.g. MP4)
+      if (discovery.mediaType === 'DIRECT_VIDEO' && discovery.selectedMediaUrl) {
+        onProgress?.('⬇️ Direct video stream detected, downloading...', 25);
+        const rawFile = path.join(downloadDir, `raw_direct_${Date.now()}.bin`);
+        const finalMp4 = path.join(downloadDir, `direct_output_${Date.now()}.mp4`);
 
-      // Check HTTP Response Content-Type:
-      // application/vnd.apple.mpegurl, application/x-mpegURL, application/mpegurl
-      const contentType = res.headers.get('content-type') || '';
-      if (isHlsContentType(contentType)) {
-        logger.info(`Engine 1: HTTP Content-Type indicates HLS stream (${contentType}) at ${targetUrl}`);
-        task.streamUrl = targetUrl;
-        task.discoveredAt = Date.now();
-        task.streamHeaders = {
-          'user-agent': requestHeaders['User-Agent'],
-          referer: targetUrl,
-          origin: requestHeaders['Origin'],
-        };
-        return {
-          success: false,
-          engineName: this.name,
-          error: `Content-type (${contentType}) indicates HLS stream, passing to FFmpeg HLS engine`,
-          errorType: 'NO_M3U8_FOUND',
-        };
-      }
-
-      if (contentType.includes('video/')) {
-        onProgress?.('⬇️ Video response detected from URL...', 25);
-        const rawFile = path.join(downloadDir, `raw_stream_${Date.now()}.bin`);
-        const finalMp4 = path.join(downloadDir, `stream_output_${Date.now()}.mp4`);
-
-        if (!res.body) {
-          throw new Error('Response body was empty');
-        }
-
-        const fileStream = fs.createWriteStream(rawFile);
-        await finished(Readable.fromWeb(res.body as any).pipe(fileStream));
-
+        await this.downloadDirectStream(discovery.selectedMediaUrl, rawFile, onProgress, task.abortController.signal);
         await remuxToTelegramMp4(rawFile, finalMp4);
-        return {
-          success: true,
-          outputPath: finalMp4,
-          engineName: this.name,
-        };
-      }
 
-      // Parse HTML
-      const html = await res.text();
-
-      // Check if raw response text is actually an M3U8 playlist (e.g. starts with #EXTM3U)
-      if (html.trim().startsWith('#EXTM3U')) {
-        logger.info(`Engine 1: URL returned raw M3U8 playlist content: ${targetUrl}`);
-        task.streamUrl = targetUrl;
-        task.discoveredAt = Date.now();
-        task.streamHeaders = {
-          'user-agent': requestHeaders['User-Agent'],
-          referer: targetUrl,
-          origin: requestHeaders['Origin'],
-        };
-
-        const enc = detectHlsEncryption(html);
-        if (enc.isDrm) {
+        if (fs.existsSync(finalMp4) && fs.statSync(finalMp4).size > 1000) {
           return {
-            success: false,
+            success: true,
+            outputPath: finalMp4,
             engineName: this.name,
-            error: enc.reason,
-            errorType: 'DRM_PROTECTED',
-            details: { isDrm: true, encryption: enc },
           };
         }
-
-        return {
-          success: false,
-          engineName: this.name,
-          error: 'Response body is raw M3U8 playlist, proceeding to HLS engine',
-          errorType: 'NO_M3U8_FOUND',
-        };
       }
 
-      // Extract metadata with strict thumbnail priorities
-      if (!task.metadata || !task.metadata.originalTitle) {
-        task.metadata = await extractHtmlMetadata(html, targetUrl);
-      }
-
-      // Deep M3U8 scan: <source>, <video>, <link preload>, data attributes, embedded JSON, JS variables, player configs
-      const scanResult = scanHtmlForM3u8AndMedia(html, targetUrl);
-      if (scanResult.primaryM3u8) {
-        logger.info(`Engine 1 deep scan discovered M3U8: ${scanResult.primaryM3u8}`);
-        task.streamUrl = scanResult.primaryM3u8;
+      // If HLS Master or Media playlist was discovered
+      if (discovery.selectedMediaUrl && (discovery.mediaType === 'HLS_MASTER' || discovery.mediaType === 'HLS_MEDIA')) {
+        logger.info(`[DirectEngine] Discovered HLS stream: ${discovery.selectedMediaUrl}`);
+        task.streamUrl = discovery.selectedMediaUrl;
         task.discoveredAt = Date.now();
-        task.streamHeaders = {
-          'user-agent': requestHeaders['User-Agent'],
-          referer: targetUrl,
-          origin: requestHeaders['Origin'],
-        };
+        if (discovery.selectedVariant) {
+          task.selectedVariant = discovery.selectedVariant;
+        }
 
         if (!task.discoveredMedia) {
           task.discoveredMedia = [];
         }
-        for (const u of scanResult.foundUrls) {
+        for (const c of discovery.candidates) {
           task.discoveredMedia.push({
-            streamUrl: u,
-            isHls: true,
+            streamUrl: c.url,
+            isHls: c.mediaType === 'HLS_MASTER' || c.mediaType === 'HLS_MEDIA',
             headers: { ...task.streamHeaders },
             discoveredAt: Date.now(),
-            isSigned: isSignedUrl(u),
+            isSigned: isSignedUrl(c.url),
           });
-        }
-
-        if (scanResult.sourceThumbnail && (!task.metadata || !task.metadata.sourceThumbnail)) {
-          if (!task.metadata) task.metadata = {};
-          task.metadata.sourceThumbnail = scanResult.sourceThumbnail;
-          if (!task.metadata.thumbnail) task.metadata.thumbnail = scanResult.sourceThumbnail;
         }
 
         return {
           success: false,
           engineName: this.name,
-          error: `Extracted M3U8 URL (${scanResult.primaryM3u8.slice(0, 60)}...), proceeding to downstream engines`,
+          error: `Discovered HLS media (${discovery.selectedMediaUrl.slice(0, 60)}...), proceeding to downstream engines`,
           errorType: 'NO_M3U8_FOUND',
         };
       }
@@ -223,7 +138,7 @@ export class DirectEngine extends BaseEngine {
       return {
         success: false,
         engineName: this.name,
-        error: 'No direct video stream or static M3U8 found in HTML tags/scripts',
+        error: 'No media discovered in static HTML/JS/iframes, proceeding to Playwright browser network discovery',
         errorType: 'NO_MEDIA_FOUND',
       };
     } catch (err: any) {

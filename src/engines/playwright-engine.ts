@@ -14,8 +14,10 @@ import { normalizeCookies, mergeCookieStrings } from '../utils/cookie-manager.ts
 import { extractHtmlMetadata } from '../utils/metadata.ts';
 import { isSignedUrl } from '../utils/signed-url.ts';
 import { FfmpegEngine } from './ffmpeg-engine.ts';
+import { Aria2Engine } from './aria2-engine.ts';
 import { YtdlpEngine } from './ytdlp-engine.ts';
 import { StreamlinkEngine } from './streamlink-engine.ts';
+import { resolveNativeVideoVariant } from '../utils/variant-resolver.ts';
 import { logger } from '../logger.ts';
 
 export class PlaywrightEngine extends BaseEngine {
@@ -47,6 +49,7 @@ export class PlaywrightEngine extends BaseEngine {
         };
       }
 
+      logger.info('[DISCOVERY] Starting network discovery...');
       onProgress?.(`🧭 Launching Chromium (${resolved.source}) for deep network inspection...`, 25);
 
       const { isPRoot } = isTermuxOrPRoot();
@@ -174,7 +177,7 @@ export class PlaywrightEngine extends BaseEngine {
             (resourceType === 'fetch' && (lower.includes('playlist') || lower.includes('manifest') || lower.includes('stream'))) ||
             (resourceType === 'xhr' && (lower.includes('playlist') || lower.includes('manifest') || lower.includes('stream')))
           ) {
-            logger.info(`[Playwright] Intercepted media request (${resourceType}): ${reqUrl}`);
+            logger.info(`[DISCOVERY] Found candidate: ${reqUrl} (network ${resourceType})`);
             recordMedia(reqUrl, request.headers(), undefined, isHls);
           }
         } catch {
@@ -182,8 +185,8 @@ export class PlaywrightEngine extends BaseEngine {
         }
       });
 
-      // 2. Intercept network responses (by Content-Type MIME and URL)
-      page.on('response', response => {
+      // 2. Intercept network responses (by Content-Type MIME, body check, and URL)
+      page.on('response', async response => {
         try {
           const respUrl = response.url();
           const contentType = (response.headers()['content-type'] || '').toLowerCase();
@@ -203,10 +206,21 @@ export class PlaywrightEngine extends BaseEngine {
             detectedHeaders['cookie'] = task.cookies;
           }
 
-          if (isHlsMime || isHlsFromUrl || isVideoMime) {
-            logger.info(`[Playwright] Intercepted media response (${contentType || 'url-match'}): ${respUrl}`);
+          let isHlsFromBody = false;
+          const reqType = response.request().resourceType();
+          if (!isHlsMime && !isHlsFromUrl && (reqType === 'xhr' || reqType === 'fetch')) {
+            try {
+              const bodySnippet = await response.text();
+              if (bodySnippet && bodySnippet.trim().startsWith('#EXTM3U')) {
+                isHlsFromBody = true;
+              }
+            } catch {}
+          }
+
+          if (isHlsMime || isHlsFromUrl || isVideoMime || isHlsFromBody) {
+            logger.info(`[DISCOVERY] Found candidate: ${respUrl} (response: ${contentType || 'body-match'})`);
             const req = response.request();
-            recordMedia(respUrl, req ? req.headers() : undefined, contentType, isHlsMime || isHlsFromUrl);
+            recordMedia(respUrl, req ? req.headers() : undefined, contentType, isHlsMime || isHlsFromUrl || isHlsFromBody);
           }
         } catch {
           // Ignore header read issues
@@ -353,13 +367,49 @@ export class PlaywrightEngine extends BaseEngine {
         task.streamHeaders = detectedHeaders;
         task.discoveredMedia = discoveredMedia;
 
+        // Apply Native Variant Selection
+        try {
+          const resolved = await resolveNativeVideoVariant(detectedStreamUrl, {
+            headers: detectedHeaders,
+            cookies: task.cookies,
+            skipNetworkValidation: true,
+          });
+          if (resolved.selectedVariant) {
+            task.selectedVariant = resolved.selectedVariant;
+            task.streamUrl = resolved.selectedVariant.url;
+            logger.info(`[Playwright] Native variant resolved: ${resolved.selectedVariant.label}`);
+          }
+        } catch {}
+
         onProgress?.('🔎 Stream intercepted! Handing off to downstream downloader...', 38);
+
+        // Downstream Step 0: Try Aria2 Parallel Downloader for HLS
+        const aria2Engine = new Aria2Engine();
+        if (await aria2Engine.isAvailable()) {
+          try {
+            onProgress?.('⬇️ Intercepted stream! Downloading via Aria2 parallel engine...', 42);
+            const aria2Result = await aria2Engine.download(task, onProgress);
+            if (aria2Result.success && aria2Result.outputPath) {
+              return {
+                success: true,
+                outputPath: aria2Result.outputPath,
+                engineName: this.name,
+                details: {
+                  interceptedUrl: task.streamUrl,
+                  downloader: aria2Engine.name,
+                },
+              };
+            }
+          } catch (err: any) {
+            logger.warn(`Aria2 pass failed on intercepted stream: ${err.message}`);
+          }
+        }
 
         // Downstream Step 1: FFmpeg Direct HLS remuxing with full propagated headers
         const ffmpegEngine = new FfmpegEngine();
         if (await ffmpegEngine.isAvailable()) {
           try {
-            onProgress?.('⬇️ Intercepted M3U8! Downloading via FFmpeg HLS engine...', 42);
+            onProgress?.('⬇️ Downloading via FFmpeg HLS stream copy...', 48);
             const ffmpegResult = await ffmpegEngine.download(task, onProgress);
             if (ffmpegResult.success && ffmpegResult.outputPath) {
               return {
@@ -367,7 +417,7 @@ export class PlaywrightEngine extends BaseEngine {
                 outputPath: ffmpegResult.outputPath,
                 engineName: this.name,
                 details: {
-                  interceptedUrl: detectedStreamUrl,
+                  interceptedUrl: task.streamUrl,
                   downloader: ffmpegEngine.name,
                 },
               };
