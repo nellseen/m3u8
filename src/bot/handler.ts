@@ -285,6 +285,22 @@ export class BotHandler {
           }
         }
 
+        let lastReportedPercent = -1;
+        let lastProgressTime = 0;
+        const uploadProgressCb = async (progress: number) => {
+          const percent = Math.min(100, Math.max(0, Math.round(progress * 100)));
+          const now = Date.now();
+          if (
+            percent === 100 ||
+            (percent >= lastReportedPercent + 10 && now - lastProgressTime >= 2000) ||
+            (now - lastProgressTime >= 5000 && percent !== lastReportedPercent)
+          ) {
+            lastReportedPercent = percent;
+            lastProgressTime = now;
+            await progressTracker.update(`📤 Upload ke Channel (${targetChannelStr}): ${percent}%`);
+          }
+        };
+
         let sentMessage: any;
         logger.telegram(`[TELEGRAM] Uploading to target channel ${targetChannelStr}`);
         try {
@@ -294,12 +310,7 @@ export class BotHandler {
             thumb: validThumb,
             attributes: [videoAttr],
             supportsStreaming: true,
-            progressCallback: async (progress: number) => {
-              const percent = Math.round(progress * 100);
-              if (percent % 25 === 0) {
-                await progressTracker.update(`📤 Upload ke Channel (${targetChannelStr}): ${percent}%`);
-              }
-            },
+            progressCallback: uploadProgressCb,
           });
         } catch (sendErr: any) {
           // If error specifically mentions thumb/image or PHOTO_INVALID, retry without thumbnail immediately
@@ -312,12 +323,7 @@ export class BotHandler {
               thumb: undefined,
               attributes: [videoAttr],
               supportsStreaming: true,
-              progressCallback: async (progress: number) => {
-                const percent = Math.round(progress * 100);
-                if (percent % 25 === 0) {
-                  await progressTracker.update(`📤 Upload ke Channel (${targetChannelStr}): ${percent}%`);
-                }
-              },
+              progressCallback: uploadProgressCb,
             });
           } else {
             throw sendErr;

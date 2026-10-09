@@ -46,7 +46,7 @@ export function sanitizeUserReason(reason: string): string {
   let clean = reason;
 
   // Remove stack traces (e.g. "at Object.<anonymous> (/path/file.ts:12:34)")
-  clean = clean.split(/\n\s*at\s+/)[0];
+  clean = clean.split(/(?:\r?\n\s*at\s+|\s+at\s+[A-Za-z0-9_$.<>]+\s*\()/)[0];
 
   // Remove raw file paths like /usr/..., /tmp/..., /home/...
   clean = clean.replace(/(\/[a-zA-Z0-9_\-\.]+)+/g, match => {

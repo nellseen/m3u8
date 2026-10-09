@@ -234,12 +234,18 @@ export class FfmpegEngine extends BaseEngine {
       if (headerStr && isHttp(videoUrl)) {
         args.push('-headers', headerStr);
       }
+      if (isHttp(videoUrl)) {
+        args.push('-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
+      }
       args.push('-i', videoUrl);
 
       // If separated audio track is provided, add as second input
       if (audioUrl) {
         if (headerStr && isHttp(audioUrl)) {
           args.push('-headers', headerStr);
+        }
+        if (isHttp(audioUrl)) {
+          args.push('-reconnect', '1', '-reconnect_at_eof', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
         }
         args.push('-i', audioUrl);
         args.push(

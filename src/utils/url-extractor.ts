@@ -50,6 +50,48 @@ export function isValidHttpUrl(string: string): boolean {
 }
 
 /**
+ * Validates against Server-Side Request Forgery (SSRF) targeting internal subnets and loopback addresses.
+ * Localhost is permitted during testing (NODE_ENV=test or ALLOW_LOCAL_NETWORK=true).
+ */
+export function isSafeNetworkUrl(string: string): boolean {
+  if (!isValidHttpUrl(string)) return false;
+  if (process.env.NODE_ENV === 'test' || process.env.ALLOW_LOCAL_NETWORK === 'true') {
+    return true;
+  }
+  try {
+    const parsed = new URL(string);
+    const host = parsed.hostname.toLowerCase();
+
+    // Disallow loopback and metadata endpoints
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '0.0.0.0' ||
+      host === '::1' ||
+      host === '169.254.169.254' || // Cloud instance metadata
+      host === 'metadata.google.internal'
+    ) {
+      return false;
+    }
+
+    // Disallow RFC1918 private IPv4 ranges
+    const parts = host.split('.').map(Number);
+    if (parts.length === 4 && parts.every(p => !isNaN(p) && p >= 0 && p <= 255)) {
+      if (parts[0] === 10) return false;
+      if (parts[0] === 127) return false;
+      if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+      if (parts[0] === 192 && parts[1] === 168) return false;
+      if (parts[0] === 169 && parts[1] === 254) return false;
+      if (parts[0] === 0) return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Normalizes URL candidate from relative, escaped, or query-encoded paths
  */
 export function normalizeMediaUrl(candidate: string, baseUrl?: string): string | null {

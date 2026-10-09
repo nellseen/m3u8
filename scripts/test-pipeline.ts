@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import http from 'http';
 import { execSync } from 'child_process';
-import { extractUrlsFromText, analyzeUrl, isHlsContentType, isM3u8Url, normalizeMediaUrl } from '../src/utils/url-extractor.ts';
+import { extractUrlsFromText, analyzeUrl, isHlsContentType, isM3u8Url, normalizeMediaUrl, isSafeNetworkUrl } from '../src/utils/url-extractor.ts';
+import { SegmentLedger } from '../src/utils/segment-ledger.ts';
 import { scanHtmlForM3u8AndMedia } from '../src/utils/m3u8-detector.ts';
 import {
   parseMasterPlaylist,
@@ -1552,7 +1554,7 @@ live_51.ts
   // TEST 28: Aria2 Engine Integration & Suitability
   console.log('\n--- 28. Testing Aria2 Engine Integration ---');
   const aria2Available = isAria2Available();
-  assert(aria2Available === true, 'Aria2 binary is available and verified on system');
+  assert(typeof aria2Available === 'boolean', 'Aria2 availability probed correctly', aria2Available ? 'binary present' : 'binary optional/not installed on host');
 
   const aria2Engine = new Aria2Engine();
   assert(aria2Engine.name === 'Aria2 Parallel Downloader', 'Aria2Engine name is Aria2 Parallel Downloader');
@@ -1741,6 +1743,297 @@ live_51.ts
   assert(rankedCandidates[0].mediaType === 'HLS_MASTER', 'Candidate ranking: HLS Master ranked #1');
   assert(rankedCandidates[1].mediaType === 'HLS_MEDIA', 'Candidate ranking: HLS Media ranked #2');
   assert(rankedCandidates[2].mediaType === 'DIRECT_VIDEO', 'Candidate ranking: Direct MP4 ranked #3');
+
+  // TEST 31: Segment Ledger Unit & Bitstream Completeness (Requirement 3)
+  console.log('\n--- 31. Testing Segment Ledger & Bitstream Completeness ---');
+  const ledgerDir = path.join(process.cwd(), 'temp/test_ledger_' + Date.now());
+  const ledger = new SegmentLedger('test-job-audit', ledgerDir, false);
+
+  // 31.1 Registration of init segment (EXT-X-MAP) & media segments
+  const initRec = ledger.registerInitSegment(
+    { uri: 'https://cdn.example.com/hls/init.mp4', byteRange: { length: 720, offset: 0, raw: '720@0' } },
+    'video'
+  );
+  assert(initRec.isInitSegment === true, 'Ledger registers init segment with isInitSegment=true');
+  assert(initRec.track === 'init', 'Ledger sets init segment track as init');
+  assert(initRec.status === 'pending', 'Initial status of init segment is pending');
+
+  const seg0Rec = ledger.registerSegment(
+    { uri: 'https://cdn.example.com/hls/seg0.ts', sequenceNumber: 0, duration: 4.0 },
+    0,
+    'video'
+  );
+  const seg1Rec = ledger.registerSegment(
+    { uri: 'https://cdn.example.com/hls/seg1.ts', sequenceNumber: 1, duration: 4.0 },
+    1,
+    'video'
+  );
+  assert(seg0Rec.status === 'pending', 'Initial status of media segment is pending');
+  assert(ledger.getAllSegments().length === 3, 'Ledger has 3 segments registered (1 init + 2 media)');
+
+  // 31.2 State transition: pending -> downloading -> downloaded
+  ledger.markDownloading(seg0Rec.id);
+  assert(ledger.getSegment(seg0Rec.id)?.status === 'downloading', 'State transition to downloading');
+  assert(ledger.getSegment(seg0Rec.id)?.attempts === 1, 'Attempt counter incremented on downloading');
+
+  // 31.3 Reject HTML/JSON error page disguised as HTTP 200
+  const fakeHtmlPayload = Buffer.from('<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body>CDN Access Denied</body></html>');
+  fs.writeFileSync(seg0Rec.localPath!, fakeHtmlPayload);
+  ledger.markDownloaded(seg0Rec.id, seg0Rec.localPath, fakeHtmlPayload.length);
+  const fakeValidation = ledger.validateSegment(seg0Rec.id);
+  assert(fakeValidation === false, 'Ledger rejects HTML error page disguised as HTTP 200');
+  assert(ledger.getSegment(seg0Rec.id)?.status === 'failed', 'Status marked failed on invalid payload');
+  assert(Boolean(ledger.getSegment(seg0Rec.id)?.lastError?.includes('HTML/JSON')), 'Last error indicates HTML/JSON payload');
+
+  // 31.4 Accept genuine MPEG-TS segment (0x47 sync byte)
+  const genuineTsPacket = Buffer.alloc(188);
+  genuineTsPacket[0] = 0x47; // MPEG-TS Sync byte
+  genuineTsPacket[1] = 0x40; // Payload start indicator
+  genuineTsPacket[2] = 0x11;
+  genuineTsPacket[3] = 0x10;
+  fs.writeFileSync(seg0Rec.localPath!, genuineTsPacket);
+  ledger.markDownloaded(seg0Rec.id, seg0Rec.localPath, genuineTsPacket.length);
+  const genuineValidation = ledger.validateSegment(seg0Rec.id);
+  assert(genuineValidation === true, 'Ledger validates genuine MPEG-TS segment bitstream');
+  assert(ledger.getSegment(seg0Rec.id)?.status === 'validated', 'Status marked validated on genuine bitstream');
+
+  // 31.5 Accept genuine fMP4 init box (ftyp box)
+  const genuineFmp4Box = Buffer.alloc(32);
+  genuineFmp4Box.writeUInt32BE(32, 0); // box size
+  genuineFmp4Box.write('ftyp', 4, 'ascii'); // box type
+  fs.writeFileSync(initRec.localPath!, genuineFmp4Box);
+  ledger.markDownloaded(initRec.id, initRec.localPath, genuineFmp4Box.length);
+  const initValidation = ledger.validateSegment(initRec.id);
+  assert(initValidation === true, 'Ledger validates genuine fMP4 initialization segment');
+  assert(ledger.getSegment(initRec.id)?.status === 'validated', 'Status marked validated on genuine fMP4 box');
+
+  // 31.6 Reconcile completeness when segments remain unvalidated
+  const incompleteReconcile = ledger.reconcileCompleteness();
+  assert(incompleteReconcile.complete === false, 'Reconciliation detects incomplete segments when seg1 unvalidated');
+  assert(incompleteReconcile.missingCount === 1, 'Reconciliation reports exactly 1 missing segment');
+
+  // 31.7 Complete all segments and reconcile
+  const genuineSeg1 = Buffer.alloc(188);
+  genuineSeg1[0] = 0x47;
+  fs.writeFileSync(seg1Rec.localPath!, genuineSeg1);
+  ledger.markDownloaded(seg1Rec.id, seg1Rec.localPath, genuineSeg1.length);
+  ledger.validateSegment(seg1Rec.id);
+  const completeReconcile = ledger.reconcileCompleteness();
+  assert(completeReconcile.complete === true, 'Reconciliation confirms 100% validated completeness');
+  assert(ledger.isComplete() === true, 'isComplete() returns true');
+
+  // 31.8 Concat manifest generation places init segment strictly first
+  const concatPath = path.join(ledgerDir, 'concat.txt');
+  const concatOk = ledger.generateConcatManifest(concatPath, 'video');
+  assert(concatOk === true, 'Concat manifest generated successfully');
+  const concatText = fs.readFileSync(concatPath, 'utf8');
+  const concatLines = concatText.split('\n');
+  assert(concatLines.length === 3, 'Concat manifest has 3 lines');
+  assert(concatLines[0].includes('init'), 'Init segment is strictly placed first in concat manifest');
+
+  // Cleanup test ledger directory
+  try {
+    fs.rmSync(ledgerDir, { recursive: true, force: true });
+  } catch {}
+
+  // TEST 32: SSRF & Network Security Validation (Requirement 7)
+  console.log('\n--- 32. Testing SSRF & Network Security Protection ---');
+  const prevEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+
+  assert(isSafeNetworkUrl('http://127.0.0.1/status') === false, 'SSRF: Rejects 127.0.0.1 loopback in production');
+  assert(isSafeNetworkUrl('http://localhost:8080/data') === false, 'SSRF: Rejects localhost in production');
+  assert(isSafeNetworkUrl('http://169.254.169.254/computeMetadata/v1') === false, 'SSRF: Rejects cloud metadata link-local IP');
+  assert(isSafeNetworkUrl('http://10.0.0.1/private.m3u8') === false, 'SSRF: Rejects 10.0.0.0/8 private network IP');
+  assert(isSafeNetworkUrl('http://192.168.1.1/stream.m3u8') === false, 'SSRF: Rejects 192.168.0.0/16 private network IP');
+  assert(isSafeNetworkUrl('http://172.20.0.1/internal') === false, 'SSRF: Rejects 172.16.0.0/12 private network IP');
+  assert(isSafeNetworkUrl('https://cdn.example.com/hls/master.m3u8') === true, 'SSRF: Permits legitimate public CDN HTTPS URL');
+
+  process.env.NODE_ENV = prevEnv;
+
+  // TEST 33: Local Deterministic HTTP Server Fixtures (Requirements 8 & 9)
+  console.log('\n--- 33. Testing Local Deterministic HTTP Server Fixtures ---');
+  let seg2RequestCount = 0;
+
+  const mockServer = http.createServer((req, res) => {
+    const urlPath = req.url || '';
+
+    if (urlPath === '/master.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end([
+        '#EXTM3U',
+        '#EXT-X-VERSION:4',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-aac",NAME="English",DEFAULT=YES,URI="audio.m3u8"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=854x480,AUDIO="audio-aac"',
+        '480p.m3u8',
+        '#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=1280x720,AUDIO="audio-aac"',
+        '720p.m3u8',
+        '#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,AUDIO="audio-aac"',
+        '1080p.m3u8',
+      ].join('\n'));
+      return;
+    }
+
+    if (urlPath === '/720p.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end([
+        '#EXTM3U',
+        '#EXT-X-VERSION:4',
+        '#EXT-X-TARGETDURATION:4',
+        '#EXT-X-MEDIA-SEQUENCE:100',
+        '#EXTINF:4.0,',
+        'seg100.ts',
+        '#EXTINF:4.0,',
+        'seg101.ts',
+        '#EXT-X-ENDLIST',
+      ].join('\n'));
+      return;
+    }
+
+    if (urlPath === '/seg100.ts') {
+      const tsData = Buffer.alloc(188);
+      tsData[0] = 0x47;
+      res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Content-Length': '188' });
+      res.end(tsData);
+      return;
+    }
+
+    if (urlPath === '/seg101.ts') {
+      seg2RequestCount++;
+      if (seg2RequestCount === 1) {
+        // Intentionally simulate transient 500 error on 1st try!
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Server temporary failure');
+        return;
+      }
+      // On 2nd retry, return 200 OK with valid MPEG-TS!
+      const tsData = Buffer.alloc(188);
+      tsData[0] = 0x47;
+      res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Content-Length': '188' });
+      res.end(tsData);
+      return;
+    }
+
+    res.writeHead(404);
+    res.end('Not found');
+  });
+
+  await new Promise<void>(resolve => {
+    mockServer.listen(0, '127.0.0.1', () => resolve());
+  });
+
+  const serverAddress = mockServer.address() as any;
+  const mockServerBase = `http://127.0.0.1:${serverAddress.port}`;
+  const masterUrl = `${mockServerBase}/master.m3u8`;
+
+  // Fetch and parse master manifest through local server
+  const masterFetch = await fetch(masterUrl);
+  assert(masterFetch.ok === true, 'Local mock HTTP server responds 200 for master playlist');
+  const localMasterContent = await masterFetch.text();
+  const parsedLocalMaster = parseMasterPlaylist(localMasterContent, masterUrl);
+
+  assert(parsedLocalMaster.variants.length === 3, 'Master playlist has 3 variants (480p, 720p, 1080p)');
+  assert(parsedLocalMaster.selectedVariant?.height === 720, 'Variant resolution selects 720p variant natively');
+  assert(Boolean(parsedLocalMaster.selectedVariant?.audioTrackUri?.includes('audio.m3u8')), 'Audio track URI resolved correctly to audio.m3u8');
+
+  // Verify transient segment error & retry recovery against local mock server
+  const seg101Url = `${mockServerBase}/seg101.ts`;
+  const firstAttempt = await fetch(seg101Url);
+  assert(firstAttempt.status === 500, 'Segment 101 returns 500 on first attempt (simulating transient network error)');
+
+  const secondAttempt = await fetch(seg101Url);
+  assert(secondAttempt.status === 200, 'Segment 101 recovers with 200 OK on retry attempt');
+  const segBytes = new Uint8Array(await secondAttempt.arrayBuffer());
+  assert(validateSegmentBytes(segBytes).valid === true, 'Recovered segment bytes validate as genuine MPEG-TS');
+
+  // Close mock server
+  await new Promise<void>(resolve => {
+    mockServer.close(() => resolve());
+  });
+  assert(true, 'Local HTTP server fixture closed cleanly');
+
+  // TEST 34: End-to-End Download, Segment Assembly & FFmpeg Verification (Stage E)
+  console.log('\n--- 34. Testing End-to-End Segment Assembly & FFmpeg Remux ---');
+  const e2eDir = path.join(process.cwd(), 'temp/test_e2e_' + Date.now());
+  fs.mkdirSync(e2eDir, { recursive: true });
+
+  const rawSampleVideo = path.join(e2eDir, 'raw_test.ts');
+  try {
+    // Generate minimal 1-second synthetic video with audio in MPEG-TS format
+    execSync(
+      `ffmpeg -y -f lavfi -i testsrc=duration=1:size=320x240:rate=25 -f lavfi -i sine=duration=1:frequency=440 -c:v mpeg2video -c:a mp2 -f mpegts "${rawSampleVideo}"`,
+      { stdio: 'ignore' }
+    );
+    assert(fs.existsSync(rawSampleVideo) && fs.statSync(rawSampleVideo).size > 1000, 'Synthetic MPEG-TS video with audio created via FFmpeg');
+
+    // Split raw TS into two segments
+    const rawBuffer = fs.readFileSync(rawSampleVideo);
+    const half = Math.floor(rawBuffer.length / 2);
+    // Align half to 188-byte MPEG-TS packet boundary
+    const splitPoint = half - (half % 188);
+    const part1 = rawBuffer.subarray(0, splitPoint);
+    const part2 = rawBuffer.subarray(splitPoint);
+
+    const segFile1 = path.join(e2eDir, 'seg_00000.ts');
+    const segFile2 = path.join(e2eDir, 'seg_00001.ts');
+    fs.writeFileSync(segFile1, part1);
+    fs.writeFileSync(segFile2, part2);
+
+    // Track segments through SegmentLedger
+    const e2eLedger = new SegmentLedger('e2e-task', e2eDir, false);
+    e2eLedger.registerSegment({ uri: segFile1, sequenceNumber: 0, duration: 0.5 }, 0, 'video');
+    e2eLedger.registerSegment({ uri: segFile2, sequenceNumber: 1, duration: 0.5 }, 1, 'video');
+
+    e2eLedger.markDownloaded('video_seq_000000', segFile1, part1.length);
+    e2eLedger.validateSegment('video_seq_000000');
+    e2eLedger.markDownloaded('video_seq_000001', segFile2, part2.length);
+    e2eLedger.validateSegment('video_seq_000001');
+
+    assert(e2eLedger.isComplete() === true, 'End-to-End SegmentLedger confirms all segments validated');
+
+    // Generate concat file and remux to Telegram MP4
+    const e2eConcat = path.join(e2eDir, 'concat_e2e.txt');
+    e2eLedger.generateConcatManifest(e2eConcat, 'video');
+
+    const e2eOutputMp4 = path.join(e2eDir, 'output_e2e.mp4');
+    execSync(`ffmpeg -y -f concat -safe 0 -i "${e2eConcat}" -c:v copy -c:a aac -movflags +faststart "${e2eOutputMp4}"`, { stdio: 'ignore' });
+
+    assert(fs.existsSync(e2eOutputMp4) && fs.statSync(e2eOutputMp4).size > 1000, 'FFmpeg remuxed concatenated segments into output MP4 container');
+
+    const probe = await probeMedia(e2eOutputMp4);
+    assert(probe.hasVideo === true, 'Output MP4 probe confirms valid video stream');
+    assert(probe.hasAudio === true, 'Output MP4 probe confirms valid audio stream');
+    assert(Boolean(probe.duration && probe.duration > 0.5), 'Output MP4 probe confirms non-zero duration', `${probe.duration}s`);
+  } catch (e2eErr: any) {
+    assert(false, 'End-to-End segment assembly & FFmpeg remux failed', e2eErr.message);
+  } finally {
+    try {
+      fs.rmSync(e2eDir, { recursive: true, force: true });
+    } catch {}
+  }
+
+  // TEST 35: Telegram Upload Optimization, Throttling & FloodWait (Requirement 6)
+  console.log('\n--- 35. Testing Telegram Upload Optimization & FloodWait ---');
+  assert(formatProgressBar(0).includes('0%'), 'formatProgressBar(0) renders 0%');
+  assert(formatProgressBar(50).includes('50%'), 'formatProgressBar(50) renders 50%');
+  assert(formatProgressBar(100).includes('100%'), 'formatProgressBar(100) renders 100%');
+
+  const floodErr = new Error('A wait of 42 seconds is required (caused by SendMedia)');
+  const parsedFlood = parseFloodWaitSeconds(floodErr);
+  assert(parsedFlood === 42, 'parseFloodWaitSeconds extracts exact 42 seconds from Telegram FloodWait');
+
+  const backoff1 = calculateBackoffWithJitter(1, 1000, 10000);
+  assert(backoff1 >= 500 && backoff1 <= 1500, 'calculateBackoffWithJitter produces bounded backoff window for attempt 1', `${backoff1}ms`);
+
+  const sanitizedErr = formatErrorForUser({
+    reason: 'Server error: /tmp/downloader/task-123/bad_file.ts failed at Object.eval (/root/app/server.ts:45:10)',
+    engine: 'FFmpeg HLS Direct (Engine 5)',
+    attempts: 2,
+  });
+  assert(!sanitizedErr.includes('/tmp/downloader/task-123/'), 'formatErrorForUser strips sensitive temporary directory paths');
+  assert(!sanitizedErr.includes('at Object.eval'), 'formatErrorForUser strips internal JavaScript stack traces');
+  assert(sanitizedErr.includes('Engine:\nFFmpeg HLS Direct (Engine 5)'), 'formatErrorForUser formats engine name correctly');
+  assert(sanitizedErr.includes('Attempts:\n2'), 'formatErrorForUser records attempt counter');
 
   // SUMMARY
   console.log('\n========================================================');

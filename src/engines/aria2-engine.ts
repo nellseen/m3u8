@@ -19,6 +19,7 @@ import {
 } from '../utils/header-propagator.ts';
 import { isExpiredFailure, refreshStreamManifest } from '../utils/signed-url.ts';
 import { validateMediaFile, probeMedia } from '../utils/ffmpeg.ts';
+import { SegmentLedger, SegmentRecord } from '../utils/segment-ledger.ts';
 
 export class Aria2Engine extends BaseEngine {
   readonly name = 'Aria2 Parallel Downloader';
@@ -196,26 +197,42 @@ export class Aria2Engine extends BaseEngine {
       };
     }
 
-    // 6. Setup directories
+    // 6. Setup directories & Segment Ledger
     const segDir = path.join(task.tempDir, 'aria2_segments');
     fs.mkdirSync(segDir, { recursive: true });
 
-    const totalSegments = mediaParsed.segments.length;
+    const ledger = new SegmentLedger(task.id, segDir, mediaParsed.isLive);
+    if (mediaParsed.initSegment) {
+      ledger.registerInitSegment(mediaParsed.initSegment, 'video');
+      logger.info(`[Aria2] Registered fMP4 initialization segment: ${mediaParsed.initSegment.uri}`);
+    }
+    mediaParsed.segments.forEach((seg, idx) => {
+      ledger.registerSegment(seg, idx, 'video');
+    });
+
+    const allLedgerSegments = ledger.getAllSegments();
+    const totalSegments = allLedgerSegments.length;
     onProgressUpdate?.(`⚡ Aria2: Preparing ${totalSegments} segments for parallel download...`, 5);
 
     // 7. Helper to generate aria2 input file for pending segments
     const generateInputFile = (
-      segments: Array<{ segment: HlsSegmentItem; index: number; filename: string }>,
+      records: SegmentRecord[],
       outPath: string
     ) => {
       const lines: string[] = [];
-      for (const item of segments) {
-        lines.push(item.segment.uri);
+      for (const rec of records) {
+        if (!rec.localPath) continue;
+        const filename = path.basename(rec.localPath);
+        lines.push(rec.uri);
         lines.push(`  dir=${segDir}`);
-        lines.push(`  out=${item.filename}`);
+        lines.push(`  out=${filename}`);
 
         // Propagate headers per-URL
-        const segHeaders = buildPropagatedHeaders(task.streamHeaders, task.cookies, item.segment.uri);
+        const segHeaders = buildPropagatedHeaders(task.streamHeaders, task.cookies, rec.uri);
+        if (rec.byteRange) {
+          const rangeVal = `bytes=${rec.byteRange.offset}-${rec.byteRange.offset + rec.byteRange.length - 1}`;
+          segHeaders['Range'] = rangeVal;
+        }
         for (const [hk, hv] of Object.entries(segHeaders)) {
           lines.push(`  header=${hk}: ${hv}`);
         }
@@ -223,17 +240,11 @@ export class Aria2Engine extends BaseEngine {
       fs.writeFileSync(outPath, lines.join('\n'), 'utf8');
     };
 
-    let segmentsToDownload = mediaParsed.segments.map((s, idx) => ({
-      segment: s,
-      index: idx,
-      filename: `seg_${idx.toString().padStart(5, '0')}.ts`,
-    }));
-
     const inputFile = path.join(task.tempDir, 'aria2_input.txt');
-    generateInputFile(segmentsToDownload, inputFile);
+    generateInputFile(allLedgerSegments, inputFile);
 
     // 8. Execute aria2 parallel download
-    logger.info(`[Aria2] Spawning aria2c with ${segmentsToDownload.length} jobs (dir: ${segDir})`);
+    logger.info(`[Aria2] Spawning aria2c with ${totalSegments} jobs (dir: ${segDir})`);
     onProgressUpdate?.(`⚡ Downloading ${totalSegments} segments via aria2 parallel engine...`, 10);
 
     const runAria2Batch = async (
@@ -275,7 +286,7 @@ export class Aria2Engine extends BaseEngine {
           }
 
           try {
-            const files = fs.readdirSync(segDir).filter(f => f.startsWith('seg_') && !f.endsWith('.aria2'));
+            const files = fs.readdirSync(segDir).filter(f => !f.endsWith('.aria2'));
             const count = files.length;
             const pct = Math.min(85, Math.floor(10 + (count / totalSegments) * 75));
             onProgressUpdate?.(`⚡ Aria2 downloading: ${count}/${totalSegments} segments (${pct}%)`, pct);
@@ -302,20 +313,30 @@ export class Aria2Engine extends BaseEngine {
       });
     };
 
-    let ariaResult = await runAria2Batch(inputFile, segmentsToDownload.length);
+    let ariaResult = await runAria2Batch(inputFile, totalSegments);
 
-    // 9. Check downloaded segments and handle SIGNED URL / TOKEN EXPIRATION
-    let missingOrCorrupt = segmentsToDownload.filter(item => {
-      const fPath = path.join(segDir, item.filename);
-      return !fs.existsSync(fPath) || fs.statSync(fPath).size === 0;
-    });
+    // 9. Check downloaded segments in Ledger & perform Bitstream Validation
+    const validateLedgerSegments = () => {
+      for (const rec of ledger.getAllSegments()) {
+        if (rec.localPath && fs.existsSync(rec.localPath) && fs.statSync(rec.localPath).size > 0) {
+          ledger.markDownloaded(rec.id);
+          ledger.validateSegment(rec.id);
+        } else {
+          ledger.markFailed(rec.id, 'File missing or empty after download');
+        }
+      }
+    };
 
-    if (missingOrCorrupt.length > 0) {
-      logger.warn(`[Aria2] Initial pass completed with ${missingOrCorrupt.length}/${totalSegments} missing segments.`);
+    validateLedgerSegments();
+
+    let incomplete = ledger.getIncompleteSegments();
+
+    if (incomplete.length > 0) {
+      logger.warn(`[Aria2] Initial pass completed with ${incomplete.length}/${totalSegments} unvalidated segments.`);
 
       // Check if error is related to expired token / signed URL (HTTP 401 / 403 / expired signature)
       const combinedOutput = `${ariaResult.stdout} ${ariaResult.stderr}`;
-      const isExpired = isExpiredFailure(combinedOutput) || missingOrCorrupt.some(m => isExpiredFailure(null, m.segment.uri));
+      const isExpired = isExpiredFailure(combinedOutput) || incomplete.some(m => isExpiredFailure(null, m.uri));
 
       if (isExpired) {
         logger.info('[Aria2] Expired signed URL / token detected during segment download. Refreshing manifest for fresh candidates...');
@@ -323,18 +344,18 @@ export class Aria2Engine extends BaseEngine {
 
         const freshManifest = await refreshStreamManifest(task, actualVariantUrl);
         if (freshManifest && freshManifest.freshSegments.length > 0) {
-          logger.info(`[Aria2] Fresh manifest refreshed successfully! Re-mapping ${missingOrCorrupt.length} pending segments to fresh candidates.`);
+          logger.info(`[Aria2] Fresh manifest refreshed successfully! Re-mapping ${incomplete.length} pending segments to fresh candidates.`);
 
-          // Map remaining segments to fresh candidate URLs
-          const freshBatch: Array<{ segment: HlsSegmentItem; index: number; filename: string }> = [];
-          for (const missing of missingOrCorrupt) {
-            const freshMatch = freshManifest.freshSegments[missing.index];
-            if (freshMatch) {
-              freshBatch.push({
-                segment: freshMatch,
-                index: missing.index,
-                filename: missing.filename,
-              });
+          // Map remaining segments to fresh candidate URLs in ledger
+          const freshBatch: SegmentRecord[] = [];
+          for (const inc of incomplete) {
+            if (!inc.isInitSegment) {
+              const freshMatch = freshManifest.freshSegments[inc.sequenceNumber];
+              if (freshMatch) {
+                inc.uri = freshMatch.uri;
+                inc.status = 'pending';
+                freshBatch.push(inc);
+              }
             }
           }
 
@@ -344,20 +365,16 @@ export class Aria2Engine extends BaseEngine {
             onProgressUpdate?.(`⚡ Resuming aria2 download for ${freshBatch.length} refreshed segments...`);
 
             await runAria2Batch(freshInputFile, freshBatch.length);
-
-            // Re-check missing
-            missingOrCorrupt = segmentsToDownload.filter(item => {
-              const fPath = path.join(segDir, item.filename);
-              return !fs.existsSync(fPath) || fs.statSync(fPath).size === 0;
-            });
+            validateLedgerSegments();
           }
         }
       }
     }
 
-    // 10. Segment Validation
-    if (missingOrCorrupt.length > 0) {
-      const errorMsg = `Aria2 failed to retrieve ${missingOrCorrupt.length}/${totalSegments} segments.`;
+    // 10. Ledger Completeness Reconciliation
+    const reconciliation = ledger.reconcileCompleteness();
+    if (!reconciliation.complete) {
+      const errorMsg = `Aria2 failed to validate ${reconciliation.missingCount}/${totalSegments} segments: ${reconciliation.reason}`;
       logger.warn(`[Aria2] ${errorMsg}`);
       return {
         success: false,
@@ -367,12 +384,19 @@ export class Aria2Engine extends BaseEngine {
       };
     }
 
-    onProgressUpdate?.('🧩 All segments verified. Merging via FFmpeg...', 88);
+    onProgressUpdate?.('🧩 All segments verified via bitstream inspection. Merging via FFmpeg...', 88);
 
-    // 11. Generate Concat File for FFmpeg
+    // 11. Generate Concat File using Ledger to guarantee correct ordering (init segment first!)
     const concatFile = path.join(task.tempDir, 'segments_concat.txt');
-    const concatLines = segmentsToDownload.map(s => `file '${path.join(segDir, s.filename)}'`);
-    fs.writeFileSync(concatFile, concatLines.join('\n'), 'utf8');
+    const concatOk = ledger.generateConcatManifest(concatFile, 'video');
+    if (!concatOk) {
+      return {
+        success: false,
+        engineName: this.name,
+        error: 'Failed to generate FFmpeg concat manifest from validated segments ledger',
+        errorType: 'SEGMENT_ERROR',
+      };
+    }
 
     // 12. Concat & Remux via PURE Stream Copy (No downscale, no transcoding)
     const outputPath = path.join(task.tempDir, `aria2_output_${Date.now()}.mp4`);
