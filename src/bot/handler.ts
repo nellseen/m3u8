@@ -167,34 +167,34 @@ export class BotHandler {
     }
 
     // 5. Command: .dl <url>
-    let targetUrl: string | null = null;
+    let targetUrls: string[] = [];
     if (rawText.startsWith(`${prefix}dl `)) {
-      const urls = extractUrlsFromText(rawText.slice(prefix.length + 3));
-      if (urls.length > 0) {
-        targetUrl = urls[0];
-      } else {
+      targetUrls = [...new Set(extractUrlsFromText(rawText.slice(prefix.length + 3)))];
+      if (targetUrls.length === 0) {
         await message.reply({ message: '⚠️ Masukkan URL HTTP/HTTPS yang valid: `.dl https://...`' });
         return;
       }
     }
 
     // 6. Automatic URL Detection
-    if (!targetUrl) {
+    if (targetUrls.length === 0) {
       const shouldAutoDownload =
         (isSelf && config.autoDownloadSavedMessages) ||
         (isPrivate && config.autoDownloadPrivate) ||
         (isGroup && config.autoDownloadGroups);
 
       if (shouldAutoDownload) {
-        const urls = extractUrlsFromText(rawText);
-        if (urls.length > 0) {
-          targetUrl = urls[0];
-        }
+        targetUrls = [...new Set(extractUrlsFromText(rawText))];
       }
     }
 
-    if (targetUrl) {
-      await this.handleDownloadRequest(event, targetUrl);
+    if (targetUrls.length > 0) {
+      // Process links in order to avoid concurrent channel uploads triggering
+      // Telegram FloodWait. The original message tracks the first link;
+      // remaining links get their own editable replies.
+      for (let index = 0; index < targetUrls.length; index++) {
+        await this.handleDownloadRequest(event, targetUrls[index], index === 0);
+      }
     }
   }
 
@@ -358,15 +358,14 @@ export class BotHandler {
         // Jangan spam retry! Ikuti waktu tunggu yang diberikan Telegram.
         const floodWaitSec = parseFloodWaitSeconds(err);
         if (floodWaitSec !== null) {
-          if (floodWaitSec <= 180 && attempt < MAX_RETRIES) {
+          if (attempt < MAX_RETRIES) {
             logger.warn(`[Upload] Telegram FloodWait detected: ${floodWaitSec}s required. Waiting exact duration without spamming...`);
             await progressTracker.update(`⏳ FloodWait Telegram terdeteksi (${floodWaitSec}s). Menunggu sesuai instruksi Telegram tanpa spam...`);
             await new Promise(r => setTimeout(r, (floodWaitSec + 1) * 1000));
             // Resume loop after waiting the exact required time
             continue;
-          } else {
-            throw new Error(`Telegram FloodWait (${floodWaitSec}s) melebihi batas waktu toleransi upload.`);
           }
+          throw new Error(`Telegram masih meminta FloodWait ${floodWaitSec}s setelah ${MAX_RETRIES} percobaan upload.`);
         }
 
         // 3. Retry on network error, timeout, connection reset, and temporary Telegram errors
@@ -421,7 +420,7 @@ export class BotHandler {
     }
   }
 
-  private async handleDownloadRequest(event: NewMessageEvent, targetUrl: string): Promise<void> {
+  private async handleDownloadRequest(event: NewMessageEvent, targetUrl: string, useOriginalProgress = true): Promise<void> {
     const originalMsg = event.message;
     const chatId = originalMsg.peerId;
     const me = getCurrentUser();
@@ -441,18 +440,33 @@ export class BotHandler {
       logger.job(`[JOB] Duplicate download request for URL ${targetUrl}. Reusing active job ${existingTask.id} (Status: ${existingTask.status})`);
     }
 
-    // Send single progress message that will be continuously edited
-    let progressMsg: any;
-    try {
-      progressMsg = await originalMsg.reply({
-        message: '🔎 Detecting source...',
-      });
-    } catch (err: any) {
-      logger.error('Failed to send initial progress message:', err);
-      return;
+    // Edit the link message itself when it was sent by this userbot account.
+    // Telegram does not allow editing messages authored by other users, so
+    // those requests keep the reply-based progress message as a fallback.
+    let progressMessageId = useOriginalProgress && isSelf ? originalMsg.id : undefined;
+    if (progressMessageId !== undefined) {
+      try {
+        await this.client.editMessage(chatId, {
+          message: progressMessageId,
+          text: '🔎 Menyiapkan link...',
+          linkPreview: false,
+        });
+      } catch (err: any) {
+        logger.debug(`Cannot edit incoming link message ${progressMessageId}; falling back to reply:`, err?.message || err);
+        progressMessageId = undefined;
+      }
+    }
+    if (progressMessageId === undefined) {
+      try {
+        const progressMsg = await originalMsg.reply({ message: '🔎 Menyiapkan link...' });
+        progressMessageId = progressMsg.id;
+      } catch (err: any) {
+        logger.error('Failed to create initial progress message:', err);
+        return;
+      }
     }
 
-    const progressTracker = new ProgressTracker(this.client, chatId, progressMsg.id);
+    const progressTracker = new ProgressTracker(this.client, chatId, progressMessageId);
 
     try {
       // Execute Queue: Detect URL -> Analyze Source -> Detect HLS/M3U8 -> Resolve Media -> Download -> Validate -> FFmpeg Processing -> Extract Metadata -> Thumbnail
@@ -460,7 +474,7 @@ export class BotHandler {
         {
           originalUrl: targetUrl,
           chatId,
-          messageId: progressMsg.id,
+          messageId: progressMessageId,
         },
         async (statusText, percent) => {
           let formattedText = statusText;
@@ -611,30 +625,13 @@ export class BotHandler {
       // ─────────────────────────────────────────────────────────────
       // KIRIM STATUS BERHASIL KE USER
       // ─────────────────────────────────────────────────────────────
-      let userStatusText = `✅ **Completed**\n\n`;
-      userStatusText += `📢 **Target Channel**: \`${targetChannelStr}\`\n`;
-      userStatusText += `🆔 **Telegram Message ID**: \`#${channelMessageId}\`\n`;
-      if (postUrl) {
-        userStatusText += `🔗 **Tautan Post**: [Buka di Telegram](${postUrl})\n`;
-      }
-      userStatusText += `\n🎬 **Judul**: ${mainTitle}\n`;
-      if (origTitle) {
-        userStatusText += `🌐 **Original**: ${origTitle}\n`;
-      }
-      if (domain) {
-        userStatusText += `🔗 **Sumber**: ${domain}\n`;
-      }
-      if (durationSec > 0) {
-        userStatusText += `⏱ **Durasi**: ${formatDuration(durationSec)}\n`;
-      }
-      userStatusText += `📐 **Resolusi**: ${width && height ? `${width}x${height}` : 'Unknown'}\n`;
-      if (meta.codec) {
-        userStatusText += `🎞 **Video**: ${meta.codec}\n`;
-      }
-      if (meta.audioCodec) {
-        userStatusText += `🎵 **Audio**: ${meta.audioCodec}\n`;
-      }
-      userStatusText += `📦 **Ukuran**: ${formatBytes(fileSize)}`;
+      const userStatusText = [
+        `✅ Selesai · ${mainTitle}`,
+        `📢 Channel: ${targetChannelStr}`,
+        `📐 ${width && height ? `${width}×${height}` : 'Resolusi tidak diketahui'}${durationSec > 0 ? ` · ${formatDuration(durationSec)}` : ''}`,
+        `📦 ${formatBytes(fileSize)}`,
+        ...(postUrl ? [`🔗 ${postUrl}`] : []),
+      ].join('\n');
 
       await progressTracker.markDone(userStatusText);
 
