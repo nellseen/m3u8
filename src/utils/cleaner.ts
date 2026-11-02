@@ -15,7 +15,7 @@ import { DownloadTask, TaskSubDirectories } from '../types.ts';
  *   logs/          -> job-specific execution trace & engine logs
  *   source/        -> source html & page snapshot
  *   download/      -> raw engine output
- *   processed/     -> 720p normalized media
+ *   processed/     -> final media prepared for upload
  *
  * Ensures no two jobs share the same temporary files.
  */

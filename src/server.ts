@@ -51,7 +51,6 @@ app.get('/status', (_req: Request, res: Response) => {
     },
     activeJobs: activeJobs.map(j => ({
       id: j.id,
-      url: j.originalUrl,
       status: j.status,
       activeEngine: j.activeEngine,
       elapsedSeconds: Math.floor((Date.now() - j.startTime) / 1000),

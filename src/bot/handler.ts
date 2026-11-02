@@ -5,7 +5,7 @@ import path from 'path';
 import { config, saveTargetChannel } from '../config.ts';
 import { DownloadQueue } from '../queue/download-queue.ts';
 import { ProgressTracker } from './progress.ts';
-import { extractUrlsFromText } from '../utils/url-extractor.ts';
+import { extractUrlsFromText, isSafeNetworkUrlResolved } from '../utils/url-extractor.ts';
 import { formatBytes, formatDuration } from '../utils/system.ts';
 import { logger } from '../logger.ts';
 import { getCurrentUser } from './client.ts';
@@ -157,7 +157,7 @@ export class BotHandler {
       helpText += `• \`${prefix}help\` : Menampilkan petunjuk ini\n\n`;
       helpText += `**Fitur Unggulan:**\n`;
       helpText += `• 6-Layer Fallback Downloader (Direct, Playwright Sniffer, Streamlink, yt-dlp, FFmpeg HLS, Retry)\n`;
-      helpText += `• Normalisasi resolusi maksimal 720p tanpa upscaling\n`;
+      helpText += `• Memilih kualitas sumber maksimal 480p; FFmpeg hanya remux tanpa scaling video\n`;
       helpText += `• Ekstraksi metadata & terjemahan judul ke Bahasa Indonesia\n`;
       helpText += `• Pembuatan thumbnail presisi frame 25 detik\n`;
       helpText += `• Penyimpanan Telegram Message ID pasca upload channel\n\n`;
@@ -307,6 +307,7 @@ export class BotHandler {
           sentMessage = await this.client.sendFile(targetPeer, {
             file: task.outputPath!,
             caption,
+            parseMode: 'html',
             thumb: validThumb,
             attributes: [videoAttr],
             supportsStreaming: true,
@@ -320,6 +321,7 @@ export class BotHandler {
             sentMessage = await this.client.sendFile(targetPeer, {
               file: task.outputPath!,
               caption,
+              parseMode: 'html',
               thumb: undefined,
               attributes: [videoAttr],
               supportsStreaming: true,
@@ -426,6 +428,11 @@ export class BotHandler {
     const isSelf = originalMsg.out || (me && originalMsg.senderId?.toString() === me.id?.toString());
     const isPrivate = originalMsg.isPrivate;
 
+    if (!(await isSafeNetworkUrlResolved(targetUrl))) {
+      await originalMsg.reply({ message: '⛔ URL ditolak: hanya alamat HTTP/HTTPS publik yang dapat diunduh.' });
+      return;
+    }
+
     logger.job(`[JOB] Incoming download request for URL: ${targetUrl}`);
 
     // Duplicate check notification
@@ -496,8 +503,8 @@ export class BotHandler {
 
       const fileSize = completedTask.sizeBytes || fs.statSync(completedTask.outputPath).size;
       const durationSec = Math.round(completedTask.duration || 0);
-      const width = completedTask.width || 1280;
-      const height = completedTask.height || 720;
+      const width = completedTask.width || 0;
+      const height = completedTask.height || 0;
       const meta = completedTask.metadata || {};
 
       // Domain extraction for caption
@@ -514,25 +521,24 @@ export class BotHandler {
       const mainTitle = meta.translatedTitle || meta.originalTitle || 'Video';
       const origTitle = meta.originalTitle && meta.originalTitle !== mainTitle ? meta.originalTitle : undefined;
 
-      // Construct caption
-      let caption = `🎬 ${mainTitle}\n\n`;
-      if (origTitle) {
-        caption += `🌐 Original: ${origTitle}\n`;
-      }
-      if (domain) {
-        caption += `🔗 Source: ${domain}\n`;
-      }
-      if (durationSec > 0) {
-        caption += `⏱ Duration: ${formatDuration(durationSec)}\n`;
-      }
-      caption += `📐 Resolution: ${width}x${height}\n`;
-      if (meta.codec) {
-        caption += `🎞 Video: ${meta.codec}\n`;
-      }
-      if (meta.audioCodec) {
-        caption += `🎵 Audio: ${meta.audioCodec}\n`;
-      }
-      caption += `📦 Size: ${formatBytes(fileSize)}`;
+      // Telegram has no native table caption; HTML <pre> keeps columns aligned.
+      const escapeHtml = (value: unknown): string => String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      const rows: Array<[string, string]> = [];
+      if (origTitle) rows.push(['Original', origTitle]);
+      if (domain) rows.push(['Source', domain]);
+      if (durationSec > 0) rows.push(['Durasi', formatDuration(durationSec)]);
+      rows.push(['Resolusi', width && height ? `${width}x${height}` : 'Unknown']);
+      if (meta.codec) rows.push(['Video', meta.codec]);
+      if (meta.audioCodec) rows.push(['Audio', meta.audioCodec]);
+      rows.push(['Ukuran', formatBytes(fileSize)]);
+
+      const table = rows
+        .map(([label, value]) => `${label.padEnd(10)} │ ${escapeHtml(value)}`)
+        .join('\n');
+      const caption = `<b>🎬 ${escapeHtml(mainTitle)}</b>\n\n<pre>${table}</pre>`;
 
       // Streaming attribute
       const videoAttr = new Api.DocumentAttributeVideo({
@@ -621,7 +627,7 @@ export class BotHandler {
       if (durationSec > 0) {
         userStatusText += `⏱ **Durasi**: ${formatDuration(durationSec)}\n`;
       }
-      userStatusText += `📐 **Resolusi**: ${width}x${height}\n`;
+      userStatusText += `📐 **Resolusi**: ${width && height ? `${width}x${height}` : 'Unknown'}\n`;
       if (meta.codec) {
         userStatusText += `🎞 **Video**: ${meta.codec}\n`;
       }
@@ -631,18 +637,6 @@ export class BotHandler {
       userStatusText += `📦 **Ukuran**: ${formatBytes(fileSize)}`;
 
       await progressTracker.markDone(userStatusText);
-
-      // If user invoked from Saved Messages / Private, optionally forward video post for convenient playback
-      if (isSelf || isPrivate) {
-        try {
-          await this.client.forwardMessages(chatId, {
-            messages: [channelMessageId],
-            fromPeer: targetPeer,
-          });
-        } catch (fwdErr) {
-          logger.debug(`Forwarding post to requester chat skipped: ${fwdErr}`);
-        }
-      }
 
       // Clean up permanent video & thumbnail from disk
       this.cleanupTaskFiles(completedTask);

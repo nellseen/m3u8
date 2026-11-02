@@ -5,7 +5,7 @@ import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
 import { getFfmpegPath } from '../utils/system.ts';
 import { validateMediaFile, probeMedia } from '../utils/ffmpeg.ts';
-import { isM3u8Url } from '../utils/url-extractor.ts';
+import { analyzeUrl, isM3u8Url } from '../utils/url-extractor.ts';
 import { parseMasterPlaylist, HlsVariant, detectHlsEncryption } from '../utils/m3u8-parser.ts';
 import { validateHlsSegments } from '../utils/segment-validator.ts';
 import { isUrlExpired } from '../utils/signed-url.ts';
@@ -71,6 +71,17 @@ export class FfmpegEngine extends BaseEngine {
     onProgress?: (statusText: string, percent?: number) => void
   ): Promise<EngineResult> {
     const rawTargetUrl = task.streamUrl || task.originalUrl;
+    const discoveredVideo = task.discoveredMedia?.some(media => media.streamUrl === rawTargetUrl && (
+      media.isDirectVideo || media.mimeType?.toLowerCase().startsWith('video/')
+    ));
+    if (!isM3u8Url(rawTargetUrl) && !analyzeUrl(rawTargetUrl).isDirectVideo && !discoveredVideo) {
+      return {
+        success: false,
+        engineName: this.name,
+        error: 'FFmpeg direct engine requires an HLS manifest or direct video URL.',
+        errorType: 'EXTRACTOR_UNSUPPORTED',
+      };
+    }
     const ffmpegBin = getFfmpegPath();
     const downloadDir = task.subDirs?.download || task.tempDir;
     const headerStr = buildFfmpegHeaders(task.streamHeaders, task.cookies);
@@ -137,7 +148,7 @@ export class FfmpegEngine extends BaseEngine {
           effectiveVideoUrl = sel.uri;
           separateAudioTrackUrl = sel.audioTrackUri;
 
-          logger.hls(`[HLS] Selected ${sel.resolution || (sel.height ? sel.height + 'p' : '720p')} variant`);
+          logger.hls(`[HLS] Selected ${sel.resolution || (sel.height ? sel.height + 'p' : 'unknown-resolution')} variant`);
           if (parsed.audioGroups.length > 0 || separateAudioTrackUrl) {
             logger.hls('[HLS] Audio group detected');
           }

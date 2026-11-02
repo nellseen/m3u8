@@ -1,4 +1,6 @@
 import { URL } from 'url';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 
 const URL_REGEX = /https?:\/\/[^\s<>"'()]+(?:\([^\s<>"']+\)|[^\s<>"'.,:;!?[\]])/gi;
 
@@ -62,9 +64,11 @@ export function isSafeNetworkUrl(string: string): boolean {
     const parsed = new URL(string);
     const host = parsed.hostname.toLowerCase();
 
-    // Disallow loopback and metadata endpoints
+    // Disallow local, link-local, multicast, and metadata destinations.
     if (
       host === 'localhost' ||
+      host.endsWith('.localhost') ||
+      host.endsWith('.local') ||
       host === '127.0.0.1' ||
       host === '0.0.0.0' ||
       host === '::1' ||
@@ -74,7 +78,7 @@ export function isSafeNetworkUrl(string: string): boolean {
       return false;
     }
 
-    // Disallow RFC1918 private IPv4 ranges
+    // Disallow non-public IPv4 ranges.
     const parts = host.split('.').map(Number);
     if (parts.length === 4 && parts.every(p => !isNaN(p) && p >= 0 && p <= 255)) {
       if (parts[0] === 10) return false;
@@ -83,9 +87,38 @@ export function isSafeNetworkUrl(string: string): boolean {
       if (parts[0] === 192 && parts[1] === 168) return false;
       if (parts[0] === 169 && parts[1] === 254) return false;
       if (parts[0] === 0) return false;
+      if (parts[0] >= 224) return false;
+    }
+
+    // URL.hostname includes brackets for IPv6 in some Node versions.
+    const ipv6 = host.replace(/^\[|\]$/g, '');
+    if (isIP(ipv6) === 6) {
+      const normalized = ipv6.toLowerCase();
+      if (normalized === '::' || normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe8') || normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb') || normalized.startsWith('ff')) return false;
+      if (normalized.startsWith('::ffff:')) {
+        const mapped = normalized.slice(7);
+        if (!isSafeNetworkUrl(`http://${mapped}/`)) return false;
+      }
     }
 
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Resolves hostnames and rejects URLs that point at non-public IP addresses. */
+export async function isSafeNetworkUrlResolved(value: string): Promise<boolean> {
+  if (!isSafeNetworkUrl(value)) return false;
+  if (process.env.NODE_ENV === 'test' || process.env.ALLOW_LOCAL_NETWORK === 'true') return true;
+  try {
+    const { hostname } = new URL(value);
+    if (isIP(hostname.replace(/^\[|\]$/g, ''))) return true;
+    const addresses = await lookup(hostname, { all: true, verbatim: true });
+    return addresses.length > 0 && addresses.every(({ address }) => {
+      const ipHost = isIP(address) === 6 ? `[${address}]` : address;
+      return isSafeNetworkUrl(`http://${ipHost}/`);
+    });
   } catch {
     return false;
   }

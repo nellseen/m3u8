@@ -1,6 +1,6 @@
 # Telegram HLS/M3U8 Downloader Userbot
 
-Telegram Userbot downloader berperforma tinggi berbasis **GramJS** yang bertindak sebagai akun pengguna Telegram nyata (bukan Bot API biasa). Userbot ini dirancang untuk mendeteksi URL video/halaman web, mengekstraksi sumber HLS (`.m3u8`), mengunduh menggunakan sistem multi-layer fallback 6 lapis, memproses container dan metadata video dengan FFmpeg (resolusi maksimal 720p tanpa upscale untuk efisiensi CPU & RAM), lalu mengirimkan video kembali ke chat asal dengan dukungan native streaming player Telegram.
+Telegram Userbot downloader berperforma tinggi berbasis **GramJS** yang bertindak sebagai akun pengguna Telegram nyata (bukan Bot API biasa). Userbot ini dirancang untuk mendeteksi URL video/halaman web, mengekstraksi sumber HLS (`.m3u8`), mengunduh menggunakan sistem multi-layer fallback 6 lapis, memproses container dan metadata video dengan FFmpeg (memilih kualitas sumber maksimal 480p tanpa scaling video untuk efisiensi CPU & RAM), lalu mengirimkan video kembali ke chat asal dengan dukungan native streaming player Telegram.
 
 Dirancang khusus dan dioptimalkan untuk berjalan di lingkungan **Termux (Android)** dan **Ubuntu via PRoot ARM64**, serta Linux server standar (x86_64).
 
@@ -20,16 +20,16 @@ Dirancang khusus dan dioptimalkan untuk berjalan di lingkungan **Termux (Android
         ▼
 [ Fallback Orchestrator (6 Lapis Kaskade) ]
  ├── ENGINE 1: Direct / HLS Detection (HTTP Streams & Cheerio parser)
- ├── ENGINE 2: Playwright + Chromium Sniffer (Generic Fallback: Sniffs .m3u8 & auto-downloads)
- ├── ENGINE 3: Streamlink CLI (HLS/VOD & Livestream capture, prioritas <= 720p)
- ├── ENGINE 4: yt-dlp CLI (Multi-fragment extractor, prioritas <= 720p)
+ ├── ENGINE 2: Playwright + Chromium Sniffer (Generic Fallback: Sniffs .m3u8 and hands off to the orchestrator)
+ ├── ENGINE 3: Streamlink CLI (HLS/VOD & Livestream capture, prioritas <= 480p)
+ ├── ENGINE 4: yt-dlp CLI (Multi-fragment extractor, prioritas <= 480p)
  ├── ENGINE 5: FFmpeg Direct Stream (Segment assembly & remuxer)
  └── ENGINE 6: Secondary Discovered Media Retry
         │
         ▼
 [ FFmpeg Processing Engine ]
  ├── Remux MP4: -c copy -bsf:a aac_adtstoasc -movflags +faststart
- ├── Normalisasi Skala: Maksimal 720p (menolak upscale)
+ ├── Pemilihan kualitas sumber: maksimal 480p; FFmpeg hanya remux tanpa scaling video
  ├── Probe: Video/Audio Codecs, Duration, Width, Height
  └── Snapshot: JPEG Thumbnail Generator (320px)
         │
@@ -72,8 +72,8 @@ Dirancang khusus dan dioptimalkan untuk berjalan di lingkungan **Termux (Android
     │   ├── base.ts           # Abstract base class untuk download engine
     │   ├── direct-engine.ts  # Engine 1: Direct stream & Cheerio HTML parser
     │   ├── playwright-engine.ts # Engine 2: Generic fallback sniffer & downstream delegate
-    │   ├── streamlink-engine.ts # Engine 3: Streamlink runner (max 720p)
-    │   ├── ytdlp-engine.ts   # Engine 4: yt-dlp fragment downloader (max 720p)
+    │   ├── streamlink-engine.ts # Engine 3: Streamlink runner (max 480p)
+    │   ├── ytdlp-engine.ts   # Engine 4: yt-dlp fragment downloader (max 480p)
     │   ├── ffmpeg-engine.ts  # Engine 5: FFmpeg direct HLS remuxer
     │   ├── retry-engine.ts   # Engine 6: Secondary discovered media retry
     │   └── orchestrator.ts   # Fallback pipeline orchestrator
@@ -151,7 +151,7 @@ User mengirim URL
         ↓
   Validate file
         ↓
-FFmpeg processing (Max 720p, no upscaling)
+FFmpeg remux (sumber maksimal 480p, tanpa scaling video)
         ↓
   Extract metadata (Judul Bahasa Indonesia)
         ↓

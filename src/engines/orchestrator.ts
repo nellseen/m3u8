@@ -12,17 +12,14 @@ import { killTaskProcesses } from '../utils/cleaner.ts';
 import { validateMediaFile } from '../utils/ffmpeg.ts';
 import { logger } from '../logger.ts';
 import { evaluateRetryPolicy, executeTaskRetryAction } from '../utils/retry-handler.ts';
-import { isM3u8Url } from '../utils/url-extractor.ts';
+import { analyzeUrl, isM3u8Url } from '../utils/url-extractor.ts';
 import { isUrlExpired } from '../utils/signed-url.ts';
 import { detectHlsEncryption, parseHlsManifest } from '../utils/m3u8-parser.ts';
 import { planEngineRoute, EngineRegistry, RouteDecision } from '../utils/source-router.ts';
 import { buildPropagatedHeaders } from '../utils/header-propagator.ts';
 
-function classifyError(errStr: string, explicitType?: ErrorCategory, hasStreamUrl = false): ErrorCategory {
+function classifyError(errStr: string, explicitType?: ErrorCategory): ErrorCategory {
   if (explicitType) {
-    if (explicitType === 'EXTRACTOR_UNSUPPORTED' && hasStreamUrl) {
-      return 'NETWORK_ERROR';
-    }
     return explicitType;
   }
   const lower = errStr.toLowerCase();
@@ -90,11 +87,15 @@ function classifyError(errStr: string, explicitType?: ErrorCategory, hasStreamUr
   if (lower.includes('invalid') || lower.includes('corrupt') || lower.includes('truncated')) {
     return 'INVALID_MEDIA';
   }
-  if (hasStreamUrl) {
-    return 'NETWORK_ERROR';
-  }
   return 'EXTRACTOR_UNSUPPORTED';
 }
+
+const RETRYABLE_ENGINE_ERRORS = new Set<ErrorCategory>([
+  'NETWORK_ERROR',
+  'TIMEOUT',
+  'EXPIRED_URL',
+  'SEGMENT_ERROR',
+]);
 
 export class FallbackOrchestrator {
   private engines: BaseEngine[] = [];
@@ -251,7 +252,8 @@ export class FallbackOrchestrator {
     onProgressUpdate?.(`🧭 Strategy: ${routeDecision.category}`);
 
     let activePipeline: BaseEngine[] = [...routeDecision.recommendedEngines];
-    let manifestAlreadyDiscovered = Boolean(task.streamUrl);
+    let mediaRouteConfigured = isM3u8Url(initialTarget) || analyzeUrl(initialTarget).isDirectVideo;
+    const engineRetries = new Map<string, number>();
 
     for (let i = 0; i < activePipeline.length; i++) {
       if (task.abortController.signal.aborted) {
@@ -282,28 +284,13 @@ export class FallbackOrchestrator {
       logger.job(`[JOB] Executing [${engine.name}] for task ${task.id}`);
 
       const engineStart = Date.now();
+      const inputBeforeEngine = task.streamUrl || task.originalUrl;
       try {
         const result = await engine.download(task, (text, percent) => {
           onProgressUpdate?.(text, percent);
         });
 
         const durationMs = Date.now() - engineStart;
-
-        // Check if an engine discovered a new manifest URL during page discovery
-        if (!manifestAlreadyDiscovered && task.streamUrl) {
-          manifestAlreadyDiscovered = true;
-          logger.info(`[Orchestrator] Manifest discovered (${task.streamUrl}). Re-planning route to bypass any remaining browser overhead.`);
-          // Switch to Direct M3U8 pipeline immediately
-          activePipeline = [
-            this.engineRegistry.aria2,
-            this.engineRegistry.ffmpeg,
-            this.engineRegistry.ytdlp,
-            this.engineRegistry.streamlink,
-            this.engineRegistry.retry,
-          ];
-          i = -1; // Next loop starts at index 0 of the new pipeline
-          continue;
-        }
 
         if (result.success && result.outputPath && fs.existsSync(result.outputPath)) {
           // Double check audio + video stream integrity
@@ -319,10 +306,29 @@ export class FallbackOrchestrator {
           }
         }
 
+        // Honor any successful result first. Otherwise, hand newly discovered
+        // media to one appropriate downstream pipeline (without nested retries).
+        const discoveredUrl = task.streamUrl || '';
+        const discoveredHls = isM3u8Url(discoveredUrl);
+        const isNewMediaUrl = discoveredUrl !== '' && discoveredUrl !== inputBeforeEngine;
+        const discoveredDirectVideo = analyzeUrl(discoveredUrl).isDirectVideo || Boolean(
+          task.discoveredMedia?.some(media => media.streamUrl === discoveredUrl && (
+            media.isDirectVideo || media.mimeType?.toLowerCase().startsWith('video/')
+          ))
+        );
+        if (!mediaRouteConfigured && isNewMediaUrl && (discoveredHls || discoveredDirectVideo)) {
+          mediaRouteConfigured = true;
+          logger.info(`[Orchestrator] ${discoveredHls ? 'HLS manifest' : 'direct video'} discovered. Re-planning once for the media URL.`);
+          activePipeline = discoveredHls
+            ? [this.engineRegistry.aria2, this.engineRegistry.ffmpeg, this.engineRegistry.ytdlp, this.engineRegistry.streamlink, this.engineRegistry.retry]
+            : [this.engineRegistry.direct, this.engineRegistry.ytdlp, this.engineRegistry.ffmpeg, this.engineRegistry.streamlink, this.engineRegistry.retry];
+          i = -1;
+          continue;
+        }
+
         // Failure on this engine -> Record, clean up, and evaluate retry / fallback
         const reason = result.error || 'Engine returned failure without message';
-        const hasStreamUrl = Boolean(task.streamUrl);
-        const errorCategory = classifyError(reason, result.errorType, hasStreamUrl);
+        const errorCategory = classifyError(reason, result.errorType);
 
         logger.taskError(task.id, engine.name, 'DOWNLOAD', errorCategory, reason);
         task.failedEngines.push({
@@ -362,28 +368,28 @@ export class FallbackOrchestrator {
         }
 
         // Error-Based Retry Evaluation
-        const retryDecision = evaluateRetryPolicy(reason, task.retryCount || 0, { maxRetries: 3 });
-        if (retryDecision.shouldRetry) {
+        const retriesUsed = engineRetries.get(engine.name) || 0;
+        const retryDecision = RETRYABLE_ENGINE_ERRORS.has(errorCategory)
+          ? evaluateRetryPolicy(reason, retriesUsed, { maxRetries: 2 })
+          : null;
+        if (retryDecision?.shouldRetry) {
+          engineRetries.set(engine.name, retriesUsed + 1);
           task.retryCount = (task.retryCount || 0) + 1;
           task.lastRetryReason = retryDecision.reason;
 
           if (retryDecision.action === 'rediscover' || retryDecision.action === 'refresh_auth') {
-            logger.info(`[Orchestrator] Retry (${task.retryCount}/3) action '${retryDecision.action}': ${retryDecision.reason}`);
+            logger.info(`[Orchestrator] Retry (${retriesUsed + 1}/2 for ${engine.name}) action '${retryDecision.action}': ${retryDecision.reason}`);
             onProgressUpdate?.(`🔄 ${retryDecision.reason}`);
             await executeTaskRetryAction(task, retryDecision);
             i = -1;
             continue;
-          } else if (retryDecision.action === 'backoff' || retryDecision.action === 'retry_immediate') {
-            logger.info(`[Orchestrator] Retry (${task.retryCount}/3) action '${retryDecision.action}': ${retryDecision.reason}`);
+          } else {
+            logger.info(`[Orchestrator] Retry (${retriesUsed + 1}/2 for ${engine.name}) action '${retryDecision.action}': ${retryDecision.reason}`);
             onProgressUpdate?.(`⏳ ${retryDecision.reason}`);
             await executeTaskRetryAction(task, retryDecision);
-            if (task.retryCount <= 2) {
-              i--;
-              continue;
-            }
+            i--;
+            continue;
           }
-        } else if ((task.retryCount || 0) >= 3) {
-          logger.warn(`[Orchestrator] MAX_RETRIES reached (${task.retryCount}/3) for task ${task.id}. Proceeding with next fallback.`);
         }
 
         if (i < activePipeline.length - 1) {
@@ -393,8 +399,7 @@ export class FallbackOrchestrator {
       } catch (err: any) {
         const durationMs = Date.now() - engineStart;
         const errStr = err?.message || String(err);
-        const hasStreamUrl = Boolean(task.streamUrl);
-        const errorCategory = classifyError(errStr, undefined, hasStreamUrl);
+        const errorCategory = classifyError(errStr);
 
         logger.taskError(task.id, engine.name, 'DOWNLOAD', errorCategory, errStr);
         task.failedEngines.push({
@@ -406,18 +411,22 @@ export class FallbackOrchestrator {
 
         killTaskProcesses(task);
 
-        const catchDecision = evaluateRetryPolicy(errStr, task.retryCount || 0, { maxRetries: 3 });
-        if (catchDecision.shouldRetry) {
+        const retriesUsed = engineRetries.get(engine.name) || 0;
+        const catchDecision = RETRYABLE_ENGINE_ERRORS.has(errorCategory)
+          ? evaluateRetryPolicy(errStr, retriesUsed, { maxRetries: 2 })
+          : null;
+        if (catchDecision?.shouldRetry) {
+          engineRetries.set(engine.name, retriesUsed + 1);
           task.retryCount = (task.retryCount || 0) + 1;
           task.lastRetryReason = catchDecision.reason;
-          logger.info(`[Orchestrator] Exception Retry (${task.retryCount}/3) action '${catchDecision.action}': ${catchDecision.reason}`);
+          logger.info(`[Orchestrator] Exception retry (${retriesUsed + 1}/2 for ${engine.name}) action '${catchDecision.action}': ${catchDecision.reason}`);
           onProgressUpdate?.(`🔄 ${catchDecision.reason}`);
           await executeTaskRetryAction(task, catchDecision);
 
           if (catchDecision.action === 'rediscover' || catchDecision.action === 'refresh_auth') {
             i = -1;
             continue;
-          } else if (task.retryCount <= 2) {
+          } else {
             i--;
             continue;
           }

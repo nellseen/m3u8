@@ -124,7 +124,9 @@ export function planEngineRoute(
   engines: EngineRegistry
 ): RouteDecision {
   const activeUrl = task.streamUrl || task.originalUrl;
-  const hasDirectManifest = Boolean(task.streamUrl) || isM3u8Url(activeUrl);
+  // streamUrl may also contain a resolved page or direct MP4 URL; only skip
+  // browser discovery when the URL itself is recognizably an HLS manifest.
+  const hasDirectManifest = isM3u8Url(task.streamUrl || '') || isM3u8Url(activeUrl);
 
   // A. If a manifest is already identified directly or via earlier discovery:
   // ROUTE DIRECTLY TO M3U8 / FFMPEG PIPELINE. NEVER LAUNCH PLAYWRIGHT.
@@ -170,10 +172,8 @@ export function planEngineRoute(
         skipPlaywright: true,
         recommendedEngines: [
           engines.direct,
-          engines.aria2,
           engines.ytdlp,
           engines.ffmpeg,
-          engines.retry,
         ],
       };
 
@@ -188,8 +188,6 @@ export function planEngineRoute(
           engines.ytdlp,
           engines.direct,
           engines.playwright,
-          engines.aria2,
-          engines.ffmpeg,
           engines.retry,
         ],
       };
@@ -204,18 +202,14 @@ export function planEngineRoute(
           engines.ytdlp,
           engines.direct,
           engines.playwright,
-          engines.aria2,
-          engines.ffmpeg,
+          engines.streamlink,
           engines.retry,
         ],
       };
 
     case 'PAGE_DISCOVERY':
     default:
-      // Page discovery:
-      // 1. DirectEngine: Deep static HTML/HTTP inspection (fast, ~100ms)
-      // 2. PlaywrightEngine: Network interception for JS-heavy/SPA pages
-      // 3. Downstream download engines
+      // Static inspection and yt-dlp are cheap/broad. Use Chromium only if they fail.
       logger.info(`[Router] Source classified as PAGE_DISCOVERY (${activeUrl}). Initializing discovery flow.`);
       return {
         category: 'PAGE_DISCOVERY',
@@ -223,10 +217,8 @@ export function planEngineRoute(
         skipPlaywright: false,
         recommendedEngines: [
           engines.direct,
-          engines.playwright,
-          engines.aria2,
-          engines.ffmpeg,
           engines.ytdlp,
+          engines.playwright,
           engines.streamlink,
           engines.retry,
         ],

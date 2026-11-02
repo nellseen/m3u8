@@ -8,6 +8,7 @@ import { validateMediaFile, remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
 import { normalizeCookies } from '../utils/cookie-manager.ts';
 import { ensureIndonesianTitle } from '../utils/translator.ts';
 import { logger } from '../logger.ts';
+import { TARGET_MAX_HEIGHT } from '../utils/variant-resolver.ts';
 
 export class YtdlpEngine extends BaseEngine {
   readonly name = 'yt-dlp (Engine 4)';
@@ -33,11 +34,12 @@ export class YtdlpEngine extends BaseEngine {
     const outputPattern = path.join(downloadDir, `ytdlp_raw_${Date.now()}.%(ext)s`);
     const finalMp4 = path.join(downloadDir, `ytdlp_final_${Date.now()}.mp4`);
 
-    onProgress?.('⬇️ yt-dlp: Initializing stream extraction (prioritizing max 720p)...', 30);
+    onProgress?.(`⬇️ yt-dlp: Selecting source quality up to ${TARGET_MAX_HEIGHT}p...`, 30);
 
-    // Format selection prioritizing native <= 720p to conserve bandwidth, RAM & processing
+    // Select a web-provided format at or below the shared cap; never re-encode
+    // a larger download to simulate a lower-resolution source.
     const formatSpec =
-      'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]/bestvideo[height<=720]+bestaudio/best[height<=720]/bv*+ba/b/best';
+      `bv*[height<=${TARGET_MAX_HEIGHT}][ext=mp4]+ba[ext=m4a]/b[height<=${TARGET_MAX_HEIGHT}][ext=mp4]/bv*[height<=${TARGET_MAX_HEIGHT}]+ba/b[height<=${TARGET_MAX_HEIGHT}]`;
 
     const args: string[] = [
       '--no-playlist',

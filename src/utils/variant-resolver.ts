@@ -1,5 +1,5 @@
 import { logger } from '../logger.ts';
-import { parseHlsManifest, isManifestContent, HlsVariant } from './m3u8-parser.ts';
+import { parseHlsManifest, isManifestContent, HlsVariant, DEFAULT_MAX_SOURCE_HEIGHT } from './m3u8-parser.ts';
 import { buildPropagatedHeaders } from './header-propagator.ts';
 
 export interface VideoVariant {
@@ -22,7 +22,7 @@ export interface VariantResolutionResult {
   resolutionNote?: string;
 }
 
-export const TARGET_MAX_HEIGHT = 720;
+export const TARGET_MAX_HEIGHT = DEFAULT_MAX_SOURCE_HEIGHT;
 
 /**
  * Standard known resolution profiles used for regex matching and candidate derivation
@@ -41,9 +41,9 @@ export const STANDARD_PROFILES: Array<{ height: number; width: number; label: st
 
 /**
  * Target Selection Algorithm (Requirement 2, 3, 17):
- * - Target Max Height: 720
- * - Filter variants: height <= 720
- * - Select: MAX(height) amongst compliant (720p > 576p > 480p > 360p > 240p > 144p)
+ * - Target Max Height: 480
+ * - Filter variants: height <= 480
+ * - Select: MAX(height) amongst compliant (480p > 360p > 240p > 144p)
  * - If tie, choose highest bandwidth
  * - Zero upscaling: lower resolutions (e.g. 480p, 360p) stay native without upscale.
  * - If only higher resolutions exist (e.g. only 1080p): NEVER transcode; return closest native variant.
@@ -56,7 +56,7 @@ export function selectBestVariant(variants: VideoVariant[], maxTargetHeight = TA
   const compliant = variants.filter(v => v.height <= maxTargetHeight && v.height > 0);
 
   if (compliant.length > 0) {
-    // Pick the highest resolution among compliant (prefer 720p over 480p over 360p)
+    // Pick the highest resolution among compliant (prefer 480p over 360p)
     compliant.sort((a, b) => {
       const hDiff = b.height - a.height;
       if (hDiff !== 0) return hDiff;
@@ -65,8 +65,7 @@ export function selectBestVariant(variants: VideoVariant[], maxTargetHeight = TA
     return compliant[0];
   }
 
-  // 2. If NO variants <= maxTargetHeight (e.g. only 1080p or 1440p):
-  // NEVER transcode. Return the lowest available resolution above 720p
+  // 2. If NO variants <= maxTargetHeight, keep the lowest native variant above 480p.
   const above = [...variants].sort((a, b) => {
     const hDiff = a.height - b.height;
     if (hDiff !== 0) return hDiff;
@@ -220,8 +219,8 @@ export function generateDirectMp4Candidates(originalUrl: string): VideoVariant[]
 
   const candidates: VideoVariant[] = [];
 
-  // Generate candidates for all standard resolutions <= 720p plus current if > 720p
-  const targetProfiles = STANDARD_PROFILES.filter(p => p.height <= 720 || p.height === currentHeight);
+  // Generate candidates up to the source cap, plus the current source resolution.
+  const targetProfiles = STANDARD_PROFILES.filter(p => p.height <= TARGET_MAX_HEIGHT || p.height === currentHeight);
 
   for (const profile of targetProfiles) {
     let candidateUrl = originalUrl;
@@ -336,12 +335,12 @@ export function extractVariantsFromMasterM3u8(masterUrl: string, manifestContent
   }
 
   return parsed.variants.map((v: HlsVariant) => {
-    const height = v.height || (v.resolution ? parseInt(v.resolution.split('x')[1], 10) : 720);
+    const height = v.height || (v.resolution ? parseInt(v.resolution.split('x')[1], 10) : 0);
     const width = v.width || (v.resolution ? parseInt(v.resolution.split('x')[0], 10) : undefined);
     return {
       width,
       height,
-      label: `${height}p`,
+      label: height ? `${height}p` : 'Native (unknown resolution)',
       url: v.uri,
       bandwidth: v.bandwidth,
       codec: v.codecs,
@@ -358,7 +357,7 @@ export function extractVariantsFromMasterM3u8(masterUrl: string, manifestContent
  * 2. Check for Master M3U8 (#EXT-X-STREAM-INF).
  * 3. Detect resolution pattern in URL path and derive MP4 candidates.
  * 4. Validate candidates via HTTP HEAD/Range requests.
- * 5. Apply Target Selection Algorithm (TARGET_MAX_HEIGHT = 720, max <= 720p).
+ * 5. Apply Target Selection Algorithm (TARGET_MAX_HEIGHT = 480, max <= 480p).
  * 6. Return selected native variant with zero transcoding.
  */
 export async function resolveNativeVideoVariant(
@@ -428,15 +427,15 @@ export async function resolveNativeVideoVariant(
     }
   }
 
-  // Fallback: If no variants detected, use source URL as native variant
+  // Fallback: keep the source URL without inventing a resolution.
   if (availableVariants.length === 0) {
     const detected = detectUrlResolutionPattern(rawUrl);
-    const nativeHeight = detected.height || 720;
+    const nativeHeight = detected.height || 0;
     availableVariants = [
       {
         width: detected.width,
         height: nativeHeight,
-        label: detected.label || `${nativeHeight}p`,
+        label: detected.label || 'Native (unknown resolution)',
         url: rawUrl,
         sourceType: 'source_native',
         isValidated: true,
@@ -459,7 +458,7 @@ export async function resolveNativeVideoVariant(
     const aCompliant = a.height <= maxTarget;
     const bCompliant = b.height <= maxTarget;
 
-    // Both compliant: highest height first (720p > 480p > 360p)
+    // Both compliant: highest height first (480p > 360p)
     if (aCompliant && bCompliant) {
       return b.height - a.height;
     }
@@ -467,7 +466,7 @@ export async function resolveNativeVideoVariant(
     if (aCompliant && !bCompliant) return -1;
     if (!aCompliant && bCompliant) return 1;
 
-    // Neither compliant (both > 720p): lowest height above 720p first (1080p < 1440p)
+    // Neither compliant: choose the closest available native resolution above the cap.
     return a.height - b.height;
   });
 

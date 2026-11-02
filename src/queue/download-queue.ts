@@ -324,8 +324,10 @@ export class DownloadQueue {
 
         if (resolution.selectedVariant) {
           task.selectedVariant = resolution.selectedVariant;
-          task.streamUrl = resolution.selectedVariant.url;
-          broadcastProgress(`Downloading ${resolution.selectedVariant.label}...`, 15);
+          if (resolution.selectedVariant.url !== inputUrl) {
+            task.streamUrl = resolution.selectedVariant.url;
+            broadcastProgress(`Downloading ${resolution.selectedVariant.label}...`, 15);
+          }
         }
       } catch (err: any) {
         logger.warn(`[Queue] Native variant resolution warning: ${err.message || err}. Proceeding with original URL.`);

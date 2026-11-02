@@ -20,6 +20,7 @@ import {
 import { isExpiredFailure, refreshStreamManifest } from '../utils/signed-url.ts';
 import { validateMediaFile, probeMedia } from '../utils/ffmpeg.ts';
 import { SegmentLedger, SegmentRecord } from '../utils/segment-ledger.ts';
+import { isM3u8Url } from '../utils/url-extractor.ts';
 
 export class Aria2Engine extends BaseEngine {
   readonly name = 'Aria2 Parallel Downloader';
@@ -73,6 +74,14 @@ export class Aria2Engine extends BaseEngine {
     const ffmpegBin = getFfmpegPath();
 
     const targetUrl = task.streamUrl || task.originalUrl;
+    if (!isM3u8Url(targetUrl)) {
+      return {
+        success: false,
+        engineName: this.name,
+        error: 'Aria2 handles HLS manifests only; target URL is not recognized as M3U8.',
+        errorType: 'NO_M3U8_FOUND',
+      };
+    }
     logger.info(`[Aria2] Initializing segment discovery for task ${task.id}: ${targetUrl.slice(0, 100)}...`);
     onProgressUpdate?.('🔍 Parsing M3U8 for aria2 parallel pipeline...');
 

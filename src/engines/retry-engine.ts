@@ -7,7 +7,7 @@ import { getFfmpegPath } from '../utils/system.ts';
 import { validateMediaFile, remuxToTelegramMp4 } from '../utils/ffmpeg.ts';
 import { buildFfmpegHeaders } from './ffmpeg-engine.ts';
 import { isUrlExpired } from '../utils/signed-url.ts';
-import { isM3u8Url } from '../utils/url-extractor.ts';
+import { analyzeUrl, isM3u8Url } from '../utils/url-extractor.ts';
 import { detectHlsEncryption } from '../utils/m3u8-parser.ts';
 import { logger } from '../logger.ts';
 
@@ -24,9 +24,14 @@ export class RetryEngine extends BaseEngine {
     onProgress?: (statusText: string, percent?: number) => void
   ): Promise<EngineResult> {
     const candidates = [
-      ...(task.discoveredMedia || []).map(m => m.streamUrl),
+      ...(task.discoveredMedia || [])
+        .filter(m => m.isHls || isM3u8Url(m.streamUrl) || m.mimeType?.toLowerCase().startsWith('video/'))
+        .map(m => m.streamUrl),
       task.streamUrl,
-    ].filter(Boolean) as string[];
+    ].filter((url): url is string => Boolean(url))
+      .filter(url => isM3u8Url(url) || analyzeUrl(url).isDirectVideo || task.discoveredMedia?.some(media =>
+        media.streamUrl === url && (media.isDirectVideo || media.mimeType?.toLowerCase().startsWith('video/'))
+      ));
 
     const uniqueCandidates = Array.from(new Set(candidates))
       .filter(u => u !== task.originalUrl)

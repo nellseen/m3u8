@@ -13,10 +13,6 @@ import { scanHtmlForM3u8AndMedia } from '../utils/m3u8-detector.ts';
 import { normalizeCookies, mergeCookieStrings } from '../utils/cookie-manager.ts';
 import { extractHtmlMetadata } from '../utils/metadata.ts';
 import { isSignedUrl } from '../utils/signed-url.ts';
-import { FfmpegEngine } from './ffmpeg-engine.ts';
-import { Aria2Engine } from './aria2-engine.ts';
-import { YtdlpEngine } from './ytdlp-engine.ts';
-import { StreamlinkEngine } from './streamlink-engine.ts';
 import { resolveNativeVideoVariant } from '../utils/variant-resolver.ts';
 import { logger } from '../logger.ts';
 
@@ -102,7 +98,8 @@ export class PlaywrightEngine extends BaseEngine {
         rawUrl: string,
         reqHeaders?: Record<string, string>,
         mimeType?: string,
-        isHlsHint?: boolean
+        isHlsHint?: boolean,
+        isVideoHint = false
       ) => {
         const norm = normalizeMediaUrl(rawUrl, targetUrl);
         if (!norm) return;
@@ -131,22 +128,32 @@ export class PlaywrightEngine extends BaseEngine {
           if (lowerHeaders['sec-fetch-site']) detectedHeaders['sec-fetch-site'] = lowerHeaders['sec-fetch-site'];
         }
 
-        if (!discoveredMedia.some(m => m.streamUrl === norm)) {
+        const existingMedia = discoveredMedia.find(m => m.streamUrl === norm);
+        if (!existingMedia) {
           discoveredMedia.push({
             streamUrl: norm,
             headers: { ...detectedHeaders },
             isHls,
+            isDirectVideo: isVideoHint || Boolean(mimeType?.toLowerCase().startsWith('video/')),
             isDash,
             mimeType,
             discoveredAt: Date.now(),
             isSigned: isSignedUrl(norm),
           });
+        } else {
+          existingMedia.isHls ||= isHls;
+          existingMedia.isDirectVideo ||= isVideoHint || Boolean(mimeType?.toLowerCase().startsWith('video/'));
+          existingMedia.mimeType = mimeType || existingMedia.mimeType;
+          existingMedia.headers = { ...detectedHeaders };
         }
 
-        // Prioritize master/playlist M3U8 over other media
+        const currentMedia = discoveredMedia.find(m => m.streamUrl === detectedStreamUrl);
+        const currentIsVideo = Boolean(currentMedia?.isDirectVideo || currentMedia?.mimeType?.toLowerCase().startsWith('video/'));
+        // Prefer manifests and confirmed video responses over opaque media requests.
         if (
           !detectedStreamUrl ||
           (isHls && !isM3u8Url(detectedStreamUrl)) ||
+          (isVideoHint && !currentIsVideo && !isM3u8Url(detectedStreamUrl)) ||
           (norm.includes('master.m3u8') && !detectedStreamUrl.includes('master.m3u8'))
         ) {
           detectedStreamUrl = norm;
@@ -178,7 +185,9 @@ export class PlaywrightEngine extends BaseEngine {
             (resourceType === 'xhr' && (lower.includes('playlist') || lower.includes('manifest') || lower.includes('stream')))
           ) {
             logger.info(`[DISCOVERY] Found candidate: ${reqUrl} (network ${resourceType})`);
-            recordMedia(reqUrl, request.headers(), undefined, isHls);
+            // A media-typed request is only a candidate. Some players point at
+            // HTML/error endpoints which Chromium still labels as media.
+            recordMedia(reqUrl, request.headers(), undefined, isHls, isVideoFile && !isHls);
           }
         } catch {
           // ignore error in handler
@@ -197,6 +206,7 @@ export class PlaywrightEngine extends BaseEngine {
             contentType.includes('application/mp4') ||
             contentType.includes('video/mp4') ||
             contentType.includes('video/webm');
+          const responseStatus = response.status();
 
           // Capture Set-Cookie headers from media / auth responses
           const setCookieHeader = response.headers()['set-cookie'];
@@ -217,10 +227,20 @@ export class PlaywrightEngine extends BaseEngine {
             } catch {}
           }
 
-          if (isHlsMime || isHlsFromUrl || isVideoMime || isHlsFromBody) {
+          const opaqueMediaResponse = reqType === 'media' && responseStatus >= 200 && responseStatus < 300 &&
+            !contentType.includes('text/html') && !contentType.includes('application/json') &&
+            !contentType.includes('text/plain');
+
+          if (isHlsMime || isHlsFromUrl || isVideoMime || isHlsFromBody || opaqueMediaResponse) {
             logger.info(`[DISCOVERY] Found candidate: ${respUrl} (response: ${contentType || 'body-match'})`);
             const req = response.request();
-            recordMedia(respUrl, req ? req.headers() : undefined, contentType, isHlsMime || isHlsFromUrl || isHlsFromBody);
+            recordMedia(
+              respUrl,
+              req ? req.headers() : undefined,
+              contentType,
+              isHlsMime || isHlsFromUrl || isHlsFromBody,
+              isVideoMime || opaqueMediaResponse
+            );
           }
         } catch {
           // Ignore header read issues
@@ -359,7 +379,7 @@ export class PlaywrightEngine extends BaseEngine {
       context = null;
       browser = null;
 
-      // GENERIC FALLBACK: If M3U8 or video stream was intercepted, capture directly and download downstream
+      // Discovery only: let the orchestrator select one downstream pipeline.
       if (detectedStreamUrl) {
         logger.info(`[Playwright] Successfully intercepted stream: ${detectedStreamUrl}`);
         task.streamUrl = detectedStreamUrl;
@@ -381,101 +401,12 @@ export class PlaywrightEngine extends BaseEngine {
           }
         } catch {}
 
-        onProgress?.('🔎 Stream intercepted! Handing off to downstream downloader...', 38);
-
-        // Downstream Step 0: Try Aria2 Parallel Downloader for HLS
-        const aria2Engine = new Aria2Engine();
-        if (await aria2Engine.isAvailable()) {
-          try {
-            onProgress?.('⬇️ Intercepted stream! Downloading via Aria2 parallel engine...', 42);
-            const aria2Result = await aria2Engine.download(task, onProgress);
-            if (aria2Result.success && aria2Result.outputPath) {
-              return {
-                success: true,
-                outputPath: aria2Result.outputPath,
-                engineName: this.name,
-                details: {
-                  interceptedUrl: task.streamUrl,
-                  downloader: aria2Engine.name,
-                },
-              };
-            }
-          } catch (err: any) {
-            logger.warn(`Aria2 pass failed on intercepted stream: ${err.message}`);
-          }
-        }
-
-        // Downstream Step 1: FFmpeg Direct HLS remuxing with full propagated headers
-        const ffmpegEngine = new FfmpegEngine();
-        if (await ffmpegEngine.isAvailable()) {
-          try {
-            onProgress?.('⬇️ Downloading via FFmpeg HLS stream copy...', 48);
-            const ffmpegResult = await ffmpegEngine.download(task, onProgress);
-            if (ffmpegResult.success && ffmpegResult.outputPath) {
-              return {
-                success: true,
-                outputPath: ffmpegResult.outputPath,
-                engineName: this.name,
-                details: {
-                  interceptedUrl: task.streamUrl,
-                  downloader: ffmpegEngine.name,
-                },
-              };
-            }
-          } catch (err: any) {
-            logger.warn(`FFmpeg pass failed on intercepted stream: ${err.message}`);
-          }
-        }
-
-        // Downstream Step 2: yt-dlp on intercepted stream
-        const ytdlpEngine = new YtdlpEngine();
-        if (await ytdlpEngine.isAvailable()) {
-          try {
-            onProgress?.('⬇️ Trying yt-dlp on intercepted M3U8 stream...', 55);
-            const ytdlpResult = await ytdlpEngine.download(task, onProgress);
-            if (ytdlpResult.success && ytdlpResult.outputPath) {
-              return {
-                success: true,
-                outputPath: ytdlpResult.outputPath,
-                engineName: this.name,
-                details: {
-                  interceptedUrl: detectedStreamUrl,
-                  downloader: ytdlpEngine.name,
-                },
-              };
-            }
-          } catch (err: any) {
-            logger.warn(`yt-dlp pass failed on intercepted stream: ${err.message}`);
-          }
-        }
-
-        // Downstream Step 3: Streamlink on intercepted stream
-        const streamlinkEngine = new StreamlinkEngine();
-        if (await streamlinkEngine.isAvailable()) {
-          try {
-            onProgress?.('⬇️ Trying Streamlink on intercepted M3U8 stream...', 70);
-            const slResult = await streamlinkEngine.download(task, onProgress);
-            if (slResult.success && slResult.outputPath) {
-              return {
-                success: true,
-                outputPath: slResult.outputPath,
-                engineName: this.name,
-                details: {
-                  interceptedUrl: detectedStreamUrl,
-                  downloader: streamlinkEngine.name,
-                },
-              };
-            }
-          } catch (err: any) {
-            logger.warn(`Streamlink pass failed on intercepted stream: ${err.message}`);
-          }
-        }
-
+        onProgress?.('🔎 Stream intercepted! Handing off to the orchestrator...', 38);
         return {
           success: false,
           engineName: this.name,
-          error: `Stream URL found (${detectedStreamUrl.slice(0, 60)}...) but downstream engines failed`,
-          errorType: 'NO_M3U8_FOUND',
+          error: 'Media URL discovered; handing off to the matching download pipeline.',
+          errorType: isM3u8Url(detectedStreamUrl) ? 'NO_M3U8_FOUND' : 'NO_MEDIA_FOUND',
         };
       }
 

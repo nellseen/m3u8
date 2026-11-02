@@ -510,12 +510,12 @@ export async function probeCandidateMedia(
           const parsed = parseHlsManifest(bodyText, candidate.url);
           if (parsed.type === 'MASTER' && parsed.variants.length > 0) {
             candidate.variants = parsed.variants.map(v => {
-              const h = v.height || (v.resolution ? parseInt(v.resolution.split('x')[1], 10) : 720);
+              const h = v.height || (v.resolution ? parseInt(v.resolution.split('x')[1], 10) : 0);
               const w = v.width || (v.resolution ? parseInt(v.resolution.split('x')[0], 10) : undefined);
               return {
                 width: w,
                 height: h,
-                label: `${h}p`,
+                label: h ? `${h}p` : 'Native (unknown resolution)',
                 url: v.uri,
                 bandwidth: v.bandwidth,
                 codec: v.codecs,
@@ -551,7 +551,7 @@ export async function probeCandidateMedia(
  * Universal Candidate Ranking Algorithm (Requirement 9):
  * 1. Valid HLS Master Playlist (with variants)
  * 2. Valid HLS Media Playlist
- * 3. Candidates with native resolution information (<= 720p preferred)
+ * 3. Candidates with native resolution information (<= 480p preferred)
  * 4. Direct playable media (MP4)
  * 5. Candidate from network discovery
  * 6. Candidate from HTML/JS discovery

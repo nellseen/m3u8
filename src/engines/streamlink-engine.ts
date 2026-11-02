@@ -7,6 +7,7 @@ import { getStreamlinkPath } from '../utils/system.ts';
 import { remuxToTelegramMp4, validateMediaFile } from '../utils/ffmpeg.ts';
 import { normalizeCookies } from '../utils/cookie-manager.ts';
 import { logger } from '../logger.ts';
+import { TARGET_MAX_HEIGHT } from '../utils/variant-resolver.ts';
 
 export class StreamlinkEngine extends BaseEngine {
   readonly name = 'Streamlink (Engine 3)';
@@ -31,7 +32,7 @@ export class StreamlinkEngine extends BaseEngine {
     const rawOutput = path.join(downloadDir, `streamlink_raw_${Date.now()}.ts`);
     const finalMp4 = path.join(downloadDir, `streamlink_output_${Date.now()}.mp4`);
 
-    onProgress?.('⬇️ Streamlink: Connecting to stream (prioritizing max 720p)...', 30);
+    onProgress?.(`⬇️ Streamlink: Selecting source quality up to ${TARGET_MAX_HEIGHT}p...`, 30);
 
     const args: string[] = [
       '--force',
@@ -75,12 +76,16 @@ export class StreamlinkEngine extends BaseEngine {
       args.push('--http-header', `Cookie=${normCookies}`);
     }
 
-    // Prioritize 720p, then lower resolutions, avoiding 1080p/4k unless fallback
+    // Restrict selection to source variants at or below the shared cap.
     let streamTarget = targetUrl;
     if (targetUrl.includes('.m3u8') && !targetUrl.startsWith('hlsvariant://') && !targetUrl.startsWith('hls://')) {
       streamTarget = `hlsvariant://${targetUrl}`;
     }
-    args.push(streamTarget, '720p,720p60,480p,360p,worst,best');
+    const qualities = [`${TARGET_MAX_HEIGHT}p`, '360p', '240p'].filter((quality, index, all) => {
+      const height = parseInt(quality, 10);
+      return height <= TARGET_MAX_HEIGHT && all.indexOf(quality) === index;
+    });
+    args.push(streamTarget, qualities.join(','));
 
     return new Promise(resolve => {
       let stderr = '';

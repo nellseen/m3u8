@@ -1,10 +1,10 @@
 import fs from 'fs';
 import path from 'path';
-import { Readable } from 'stream';
 import { finished } from 'stream/promises';
+import { once } from 'node:events';
 import { BaseEngine } from './base.ts';
 import { DownloadTask, EngineResult } from '../types.ts';
-import { analyzeUrl, isHlsContentType, normalizeMediaUrl } from '../utils/url-extractor.ts';
+import { analyzeUrl, isHlsContentType, normalizeMediaUrl, isSafeNetworkUrlResolved } from '../utils/url-extractor.ts';
 import { scanHtmlForM3u8AndMedia } from '../utils/m3u8-detector.ts';
 import { discoverMediaFromPage } from '../utils/media-discovery.ts';
 import { normalizeCookies, mergeCookieStrings } from '../utils/cookie-manager.ts';
@@ -14,6 +14,7 @@ import { extractHtmlMetadata } from '../utils/metadata.ts';
 import { isSignedUrl, isUrlExpired } from '../utils/signed-url.ts';
 import { detectHlsEncryption } from '../utils/m3u8-parser.ts';
 import { logger } from '../logger.ts';
+import { buildPropagatedHeaders } from '../utils/header-propagator.ts';
 
 export class DirectEngine extends BaseEngine {
   readonly name = 'Direct / HLS Detection (Engine 1)';
@@ -29,6 +30,9 @@ export class DirectEngine extends BaseEngine {
   ): Promise<EngineResult> {
     const targetUrl = task.streamUrl || task.originalUrl;
     const urlInfo = analyzeUrl(targetUrl);
+    const discoveredVideo = task.discoveredMedia?.some(media => media.streamUrl === targetUrl && (
+      media.isDirectVideo || media.mimeType?.toLowerCase().startsWith('video/')
+    ));
     const downloadDir = task.subDirs?.download || task.tempDir;
 
     try {
@@ -46,12 +50,12 @@ export class DirectEngine extends BaseEngine {
       }
 
       // 2. Direct Video File (.mp4, .mkv, .webm, etc.) check
-      if (urlInfo.isDirectVideo) {
+      if (urlInfo.isDirectVideo || discoveredVideo) {
         onProgress?.('⬇️ Direct video stream detected, downloading...', 20);
         const rawFile = path.join(downloadDir, `raw_direct_${Date.now()}.bin`);
         const finalMp4 = path.join(downloadDir, `direct_output_${Date.now()}.mp4`);
 
-        await this.downloadDirectStream(targetUrl, rawFile, onProgress, task.abortController.signal);
+        await this.downloadDirectStream(targetUrl, rawFile, onProgress, task.abortController.signal, task.streamHeaders, task.cookies);
 
         onProgress?.('⚙️ Processing & remuxing for Telegram...', 80);
         await remuxToTelegramMp4(rawFile, finalMp4);
@@ -74,6 +78,10 @@ export class DirectEngine extends BaseEngine {
         onProgress: (text, pct) => onProgress?.(text, pct),
       });
 
+      if (discovery.selectedMediaUrl && !(await isSafeNetworkUrlResolved(discovery.selectedMediaUrl))) {
+        throw new Error('Discovered media URL targets a non-public network address');
+      }
+
       // Forward session headers and cookies
       if (discovery.sessionHeaders) {
         task.streamHeaders = { ...task.streamHeaders, ...discovery.sessionHeaders };
@@ -93,7 +101,7 @@ export class DirectEngine extends BaseEngine {
         const rawFile = path.join(downloadDir, `raw_direct_${Date.now()}.bin`);
         const finalMp4 = path.join(downloadDir, `direct_output_${Date.now()}.mp4`);
 
-        await this.downloadDirectStream(discovery.selectedMediaUrl, rawFile, onProgress, task.abortController.signal);
+        await this.downloadDirectStream(discovery.selectedMediaUrl, rawFile, onProgress, task.abortController.signal, task.streamHeaders, task.cookies);
         await remuxToTelegramMp4(rawFile, finalMp4);
 
         if (fs.existsSync(finalMp4) && fs.statSync(finalMp4).size > 1000) {
@@ -156,13 +164,15 @@ export class DirectEngine extends BaseEngine {
     url: string,
     destination: string,
     onProgress?: (statusText: string, percent?: number) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    headers?: Record<string, string>,
+    cookies?: string
   ): Promise<void> {
     const res = await fetch(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      },
+      headers: buildPropagatedHeaders(headers, cookies, {
+        targetUrl: url,
+        defaultUserAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      }),
       signal,
     });
 
@@ -172,8 +182,9 @@ export class DirectEngine extends BaseEngine {
 
     const totalBytes = parseInt(res.headers.get('content-length') || '0', 10);
     let downloadedBytes = 0;
-
     const fileStream = fs.createWriteStream(destination);
+    const writeError = new Promise<never>((_, reject) => fileStream.once('error', reject));
+
     const body = res.body;
     if (!body) {
       throw new Error('Response body was null');
@@ -186,7 +197,9 @@ export class DirectEngine extends BaseEngine {
       const { done, value } = await reader.read();
       if (done) break;
       if (value) {
-        fileStream.write(Buffer.from(value));
+        if (!fileStream.write(Buffer.from(value))) {
+          await Promise.race([once(fileStream, 'drain'), writeError]);
+        }
         downloadedBytes += value.length;
 
         const now = Date.now();
@@ -204,5 +217,6 @@ export class DirectEngine extends BaseEngine {
     }
 
     fileStream.end();
+    await Promise.race([finished(fileStream), writeError]);
   }
 }

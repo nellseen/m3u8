@@ -68,6 +68,8 @@ export interface HlsVariant {
   isMasterPlaylist: boolean;
 }
 
+export const DEFAULT_MAX_SOURCE_HEIGHT = 480;
+
 export interface MasterPlaylistParseResult {
   isMaster: true;
   type: 'MASTER';
@@ -679,7 +681,7 @@ export function parseMasterPlaylist(
     }
   }
 
-  const selectedVariant = selectTargetVariant(variants, 720);
+  const selectedVariant = selectTargetVariant(variants, DEFAULT_MAX_SOURCE_HEIGHT);
 
   return {
     isMaster: true,
@@ -899,23 +901,22 @@ export function parseHlsManifest(
 
 /**
  * Selects the optimal variant based on target policy:
- * - Default maximum 720p height
- * - Prioritize variants with height <= 720 (highest bandwidth amongst <= 720p)
- * - If no variant is <= 720p, choose closest variant (lowest above 720p)
- * - NEVER automatically pick 1080p/1440p/2160p when 720p or lower is available.
+ * - Prefer the highest source variant at or below 480p.
+ * - If none is available, preserve the closest native variant above 480p.
+ * - This is source selection only; video is never scaled after download.
  */
-export function selectTargetVariant(variants: HlsVariant[], maxTargetHeight = 720): HlsVariant | undefined {
+export function selectTargetVariant(variants: HlsVariant[], maxTargetHeight = DEFAULT_MAX_SOURCE_HEIGHT): HlsVariant | undefined {
   if (!variants || variants.length === 0) return undefined;
   if (variants.length === 1) return variants[0];
 
   const withHeight = variants.filter(v => v.height && v.height > 0);
 
   if (withHeight.length > 0) {
-    // 1. Variants that comply with <= maxTargetHeight (e.g. 720p, 480p, 360p)
+    // 1. Variants that comply with <= maxTargetHeight (e.g. 480p, 360p)
     const compliant = withHeight.filter(v => (v.height || 0) <= maxTargetHeight);
 
     if (compliant.length > 0) {
-      // Priority 1: Height descending (prefer 720p over 480p over 360p)
+      // Priority 1: Height descending (prefer 480p over 360p)
       // Priority 2: Bandwidth descending (highest quality within chosen resolution)
       compliant.sort((a, b) => {
         const heightDiff = (b.height || 0) - (a.height || 0);
@@ -925,7 +926,7 @@ export function selectTargetVariant(variants: HlsVariant[], maxTargetHeight = 72
       return compliant[0];
     }
 
-    // 2. If NO variants are <= 720p: choose closest variant (lowest height above 720p)
+    // 2. If none are <= 480p, choose the closest native variant.
     withHeight.sort((a, b) => {
       const heightDiff = (a.height || 0) - (b.height || 0);
       if (heightDiff !== 0) return heightDiff;
@@ -934,14 +935,11 @@ export function selectTargetVariant(variants: HlsVariant[], maxTargetHeight = 72
     return withHeight[0];
   }
 
-  // If no resolution tags available, sort by bandwidth (moderate bandwidth preferred ~2.5Mbps)
+  // If resolution tags are absent, prefer the lowest-bandwidth source as the
+  // safest approximation of the requested lower-resolution quality.
   const withBandwidth = [...variants].filter(v => v.bandwidth && v.bandwidth > 0);
   if (withBandwidth.length > 0) {
-    withBandwidth.sort((a, b) => {
-      const diffA = Math.abs((a.bandwidth || 0) - 2500000);
-      const diffB = Math.abs((b.bandwidth || 0) - 2500000);
-      return diffA - diffB;
-    });
+    withBandwidth.sort((a, b) => (a.bandwidth || 0) - (b.bandwidth || 0));
     return withBandwidth[0];
   }
 

@@ -72,6 +72,7 @@ export interface ExtractedMedia {
   headers?: Record<string, string>;
   title?: string;
   isHls?: boolean;
+  isDirectVideo?: boolean;
   isDash?: boolean;
   mimeType?: string;
   cookies?: string;
