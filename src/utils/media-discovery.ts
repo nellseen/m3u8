@@ -3,6 +3,8 @@ import { logger } from '../logger.ts';
 import { normalizeMediaUrl, isM3u8Url, isHlsContentType } from './url-extractor.ts';
 import { normalizeCookies, mergeCookieStrings } from './cookie-manager.ts';
 import { detectHlsEncryption, parseHlsManifest } from './m3u8-parser.ts';
+import { ExtractedMetadata } from '../types.ts';
+import { extractHtmlMetadata } from './metadata.ts';
 import { resolveNativeVideoVariant, VideoVariant } from './variant-resolver.ts';
 
 export type CandidateMediaType = 'HLS_MASTER' | 'HLS_MEDIA' | 'DIRECT_VIDEO' | 'UNKNOWN';
@@ -40,6 +42,7 @@ export interface UniversalDiscoveryResult {
   selectedVariant?: VideoVariant;
   availableVariants: VideoVariant[];
   sourceThumbnail?: string;
+  metadata?: ExtractedMetadata;
   strategyUsed: string;
 }
 
@@ -612,6 +615,7 @@ export async function discoverMediaFromPage(
   let sessionCookies = options?.cookies || '';
   let discoveredCandidates: DiscoveredCandidate[] = [];
   let sourceThumbnail: string | undefined;
+  let pageMetadata: ExtractedMetadata | undefined;
 
   // Step 1: HTTP Fetch of main page URL
   try {
@@ -652,6 +656,9 @@ export async function discoverMediaFromPage(
     }
 
     const htmlText = await res.text();
+
+    // Capture page metadata before handing a discovered stream directly to a downloader.
+    pageMetadata = await extractHtmlMetadata(htmlText, pageUrl);
 
     // If response body is raw M3U8 playlist
     if (htmlText.trim().startsWith('#EXTM3U')) {
@@ -804,6 +811,7 @@ export async function discoverMediaFromPage(
     selectedVariant,
     availableVariants,
     sourceThumbnail,
+    metadata: pageMetadata,
     strategyUsed: topCandidate ? `discovery_${topCandidate.source}` : 'none_found',
   };
 }

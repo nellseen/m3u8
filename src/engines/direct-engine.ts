@@ -82,6 +82,11 @@ export class DirectEngine extends BaseEngine {
         throw new Error('Discovered media URL targets a non-public network address');
       }
 
+      // Keep the source page's video title even when the HLS stream is downloaded directly.
+      if (discovery.metadata) {
+        task.metadata = { ...task.metadata, ...discovery.metadata };
+      }
+
       // Forward session headers and cookies
       if (discovery.sessionHeaders) {
         task.streamHeaders = { ...task.streamHeaders, ...discovery.sessionHeaders };

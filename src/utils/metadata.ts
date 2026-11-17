@@ -6,6 +6,7 @@ import { logger } from '../logger.ts';
 
 export async function extractHtmlMetadata(html: string, pageUrl: string): Promise<ExtractedMetadata> {
   const meta: ExtractedMetadata = {};
+  let pageHeadingTitle = '';
 
   try {
     const parsedUrl = new URL(pageUrl);
@@ -18,6 +19,7 @@ export async function extractHtmlMetadata(html: string, pageUrl: string): Promis
 
   try {
     const $ = cheerio.load(html);
+    pageHeadingTitle = $('h1').first().text().replace(/\s+/g, ' ').trim();
 
     // 1. JSON-LD metadata (Priority 3: Extractor thumbnail)
     $('script[type="application/ld+json"]').each((_, el) => {
@@ -86,6 +88,11 @@ export async function extractHtmlMetadata(html: string, pageUrl: string): Promis
       if (metaDesc) {
         meta.description = metaDesc.trim();
       }
+    }
+
+    // The visible page heading is usually the actual video title; metadata tags often add a generic prefix or site branding.
+    if (pageHeadingTitle) {
+      meta.originalTitle = pageHeadingTitle;
     }
 
     // 4. Video & Source element attributes (Priority 1: sourceThumbnail)
